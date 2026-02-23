@@ -4,6 +4,11 @@
 
 Rust SQL outlet backend + SourceMod build of WhaleTracker that defers most runtime SQL writes to Rust over a persistent TCP socket. This provides the benefit of multithreading.
 
+# TODO
+
+Create a 64bit branch of https://github.com/JoinedSenses/sm-ext-socket for 64bit Source game support.
+See the original Whaletracker here: https://github.com/babasproke2/Whaletracker
+
 ## what this is
 
 `scripting/whaletracker_rust.sp` is the current compilepoint, it keeps WhaleTracker gameplay/stat logic in SourcePawn, it intercepts `QueueSaveQuery(...)` and sends SQL writes to the Rust backend (`sql_batch` over NDJSON), and read/query commands like `sm_points`, `sm_rank`, and `sm_ranks` still use SourceMod's database directly.
