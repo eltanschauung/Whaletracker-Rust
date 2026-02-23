@@ -1,0 +1,5 @@
+target/
+*.smx
+*.log
+*.pid
+.DS_Store
