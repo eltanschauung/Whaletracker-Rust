@@ -1,5 +1,7 @@
 # whaletracker-rust
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/df33e1ec-e877-41cc-ab87-910527647951" />
+
 Rust SQL outlet backend + SourceMod build of WhaleTracker that defers most runtime SQL writes to Rust over a persistent TCP socket. This provides the benefit of multithreading.
 
 ## what this is
