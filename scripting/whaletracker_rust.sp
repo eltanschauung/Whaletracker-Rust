@@ -122,6 +122,8 @@ int g_iDamageGate[MAXPLAYERS + 1];
 Database g_hDatabase = null;
 ConVar g_CvarDatabase = null;
 ConVar g_hVisibleMaxPlayers = null;
+ConVar g_hGameName = null;
+ConVar g_hGameUrl = null;
 ConVar g_hDebugMinimalStats = null;
 ConVar g_hPublicIpMode = null;
 ConVar g_hPublicIpManual = null;
@@ -311,7 +313,7 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
 
     int now = GetTime();
     float engineNow = GetEngineTime();
-    int playerCount = GetClientCount(true);
+    int playerCount = GetClientCount(false);
 
     int visibleMax = GetMaxHumanPlayers();
     if (g_hVisibleMaxPlayers != null)
@@ -329,6 +331,10 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
     char query[SAVE_QUERY_MAXLEN];
     char escapedMapName[256];
     char mapName[128];
+    char escapedGameName[128];
+    char gameName[64];
+    char escapedGameUrl[64];
+    char gameUrl[32];
     if (g_sOnlineMapName[0])
     {
         strcopy(mapName, sizeof(mapName), g_sOnlineMapName);
@@ -338,6 +344,24 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
         strcopy(mapName, sizeof(mapName), "unknown");
     }
     SQL_EscapeString(g_hDatabase, mapName, escapedMapName, sizeof(escapedMapName));
+    if (g_hGameName != null)
+    {
+        g_hGameName.GetString(gameName, sizeof(gameName));
+    }
+    if (!gameName[0])
+    {
+        strcopy(gameName, sizeof(gameName), "TF2");
+    }
+    SQL_EscapeString(g_hDatabase, gameName, escapedGameName, sizeof(escapedGameName));
+    if (g_hGameUrl != null)
+    {
+        g_hGameUrl.GetString(gameUrl, sizeof(gameUrl));
+    }
+    if (!gameUrl[0])
+    {
+        strcopy(gameUrl, sizeof(gameUrl), "440");
+    }
+    SQL_EscapeString(g_hDatabase, gameUrl, escapedGameUrl, sizeof(escapedGameUrl));
 
     char escapedHostIp[64];
     char hostIp[64];
@@ -453,12 +477,14 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
 
     Format(query, sizeof(query),
         "REPLACE INTO whaletracker_servers "
-        ... "(ip, port, playercount, visible_max, map, city, country, flags, last_update) "
-        ... "VALUES ('%s', %d, %d, %d, '%s', '%s', '%s', '%s', %d)",
+        ... "(ip, port, playercount, visible_max, game, game_url, map, city, country, flags, last_update) "
+        ... "VALUES ('%s', %d, %d, %d, '%s', '%s', '%s', '%s', '%s', '%s', %d)",
         escapedHostIp,
         g_iHostPort,
         playerCount,
         visibleMax,
+        escapedGameName,
+        escapedGameUrl,
         escapedMapName,
         escapedHostCity,
         escapedHostCountry,
@@ -1565,6 +1591,8 @@ public void OnPluginStart()
 
     g_CvarDatabase = CreateConVar("sm_whaletracker_database", DB_CONFIG_DEFAULT, "Databases.cfg entry to use for WhaleTracker");
     g_CvarDatabase.GetString(g_sDatabaseConfig, sizeof(g_sDatabaseConfig));
+    g_hGameName = CreateConVar("sm_whaletracker_game", "TF2", "Game label stored in WhaleTracker server snapshots.");
+    g_hGameUrl = CreateConVar("sm_whaletracker_game_url", "440", "Steam store app ID used for WhaleTracker server snapshots.");
 
     g_hDebugMinimalStats = CreateConVar(
         "sm_whaletracker_debug_minimal",
@@ -2135,6 +2163,8 @@ public void T_SQLConnect(Database db, const char[] error, any data)
             ... "`port` INTEGER NOT NULL,"
             ... "`playercount` INTEGER DEFAULT 0,"
             ... "`visible_max` INTEGER DEFAULT 0,"
+            ... "`game` VARCHAR(64) DEFAULT '',"
+            ... "`game_url` VARCHAR(32) DEFAULT '',"
             ... "`map` VARCHAR(128) DEFAULT '',"
             ... "`city` VARCHAR(128) DEFAULT '',"
             ... "`country` VARCHAR(8) DEFAULT '',"
@@ -2383,7 +2413,9 @@ public void WhaleTracker_CreateTable(Database db, DBResultSet results, const cha
     {
         "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS city VARCHAR(128) DEFAULT ''",
         "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS country VARCHAR(8) DEFAULT ''",
-        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS flags VARCHAR(256) DEFAULT ''"
+        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS flags VARCHAR(256) DEFAULT ''",
+        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS game VARCHAR(64) DEFAULT ''",
+        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS game_url VARCHAR(32) DEFAULT ''"
     };
 
     for (int i = 0; i < sizeof(alterServersQueries); i++)

@@ -127,6 +127,8 @@ public void T_SQLConnect(Database db, const char[] error, any data)
             ... "`port` INTEGER NOT NULL,"
             ... "`playercount` INTEGER DEFAULT 0,"
             ... "`visible_max` INTEGER DEFAULT 0,"
+            ... "`game` VARCHAR(64) DEFAULT '',"
+            ... "`game_url` VARCHAR(32) DEFAULT '',"
             ... "`map` VARCHAR(128) DEFAULT '',"
             ... "`city` VARCHAR(128) DEFAULT '',"
             ... "`country` VARCHAR(8) DEFAULT '',"
@@ -384,7 +386,9 @@ public void WhaleTracker_CreateTable(Database db, DBResultSet results, const cha
     {
         "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS city VARCHAR(128) DEFAULT ''",
         "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS country VARCHAR(8) DEFAULT ''",
-        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS flags VARCHAR(256) DEFAULT ''"
+        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS flags VARCHAR(256) DEFAULT ''",
+        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS game VARCHAR(64) DEFAULT ''",
+        "ALTER TABLE whaletracker_servers ADD COLUMN IF NOT EXISTS game_url VARCHAR(32) DEFAULT ''"
     };
 
     for (int i = 0; i < sizeof(alterServersQueries); i++)

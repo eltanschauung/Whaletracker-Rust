@@ -123,7 +123,7 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
 
     int now = GetTime();
     float engineNow = GetEngineTime();
-    int playerCount = GetClientCount(true);
+    int playerCount = GetClientCount(false);
 
     int visibleMax = GetMaxHumanPlayers();
     if (g_hVisibleMaxPlayers != null)
@@ -141,6 +141,10 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
     char query[SAVE_QUERY_MAXLEN];
     char escapedMapName[256];
     char mapName[128];
+    char escapedGameName[128];
+    char gameName[64];
+    char escapedGameUrl[64];
+    char gameUrl[32];
     if (g_sOnlineMapName[0])
     {
         strcopy(mapName, sizeof(mapName), g_sOnlineMapName);
@@ -150,6 +154,24 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
         strcopy(mapName, sizeof(mapName), "unknown");
     }
     SQL_EscapeString(g_hDatabase, mapName, escapedMapName, sizeof(escapedMapName));
+    if (g_hGameName != null)
+    {
+        g_hGameName.GetString(gameName, sizeof(gameName));
+    }
+    if (!gameName[0])
+    {
+        strcopy(gameName, sizeof(gameName), "TF2");
+    }
+    SQL_EscapeString(g_hDatabase, gameName, escapedGameName, sizeof(escapedGameName));
+    if (g_hGameUrl != null)
+    {
+        g_hGameUrl.GetString(gameUrl, sizeof(gameUrl));
+    }
+    if (!gameUrl[0])
+    {
+        strcopy(gameUrl, sizeof(gameUrl), "440");
+    }
+    SQL_EscapeString(g_hDatabase, gameUrl, escapedGameUrl, sizeof(escapedGameUrl));
 
     char escapedHostIp[64];
     char hostIp[64];
@@ -265,12 +287,14 @@ public Action Timer_UpdateOnlineStats(Handle timer, any data)
 
     Format(query, sizeof(query),
         "REPLACE INTO whaletracker_servers "
-        ... "(ip, port, playercount, visible_max, map, city, country, flags, last_update) "
-        ... "VALUES ('%s', %d, %d, %d, '%s', '%s', '%s', '%s', %d)",
+        ... "(ip, port, playercount, visible_max, game, game_url, map, city, country, flags, last_update) "
+        ... "VALUES ('%s', %d, %d, %d, '%s', '%s', '%s', '%s', '%s', '%s', %d)",
         escapedHostIp,
         g_iHostPort,
         playerCount,
         visibleMax,
+        escapedGameName,
+        escapedGameUrl,
         escapedMapName,
         escapedHostCity,
         escapedHostCountry,

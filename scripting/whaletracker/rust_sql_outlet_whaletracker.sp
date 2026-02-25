@@ -16,6 +16,7 @@ ConVar g_hRustSqlPort = null;
 ConVar g_hRustSqlQueueMax = null;
 ConVar g_hRustSqlBatchMax = null;
 ConVar g_hRustSqlServerId = null;
+ConVar g_hRustSqlDebug = null;
 
 Socket g_hRustSqlSocket = null;
 bool g_bRustSqlConnecting = false;
@@ -41,6 +42,11 @@ bool WhaleTracker_RustSocketApiAvailable()
 bool WhaleTracker_UseRustSqlOutlet()
 {
     return g_hRustSqlOutletEnabled != null && GetConVarBool(g_hRustSqlOutletEnabled) && WhaleTracker_RustSocketApiAvailable();
+}
+
+bool WhaleTracker_RustSqlDebugEnabled()
+{
+    return g_hRustSqlDebug != null && GetConVarBool(g_hRustSqlDebug);
 }
 
 bool WhaleTracker_RustSqlIsOnlineQuery(const char[] sql)
@@ -228,6 +234,7 @@ void WhaleTracker_RustInit()
     g_hRustSqlQueueMax = CreateConVar("sm_whaletracker_rust_queue_max", "4096", "Max queued SQL writes for Rust outlet before dropping oldest");
     g_hRustSqlBatchMax = CreateConVar("sm_whaletracker_rust_batch_max", "64", "Max SQL writes per Rust outlet batch");
     g_hRustSqlServerId = CreateConVar("sm_whaletracker_rust_server_id", "", "Optional server identifier for Rust SQL outlet hello");
+    g_hRustSqlDebug = CreateConVar("sm_whaletracker_rust_sql_debug", "0", "Enable verbose Rust SQL outlet debug logging (1=yes, 0=no)");
 
     WhaleTracker_RustEnsureQueues();
     WhaleTracker_RustClearInflight();
@@ -258,7 +265,8 @@ bool WhaleTracker_RustQueueSqlWrite(const char[] query, int userId, bool forceSy
     {
         if (WhaleTracker_RustSqlIsOnlineQuery(query))
         {
-            LogMessage("[WhaleTracker] Rust SQL outlet bypassed online query (forceSync=%d shuttingDown=%d): %s", forceSync ? 1 : 0, g_bShuttingDown ? 1 : 0, query);
+            if (WhaleTracker_RustSqlDebugEnabled())
+                LogMessage("[WhaleTracker] Rust SQL outlet bypassed online query (forceSync=%d shuttingDown=%d): %s", forceSync ? 1 : 0, g_bShuttingDown ? 1 : 0, query);
         }
         return false;
     }
@@ -288,12 +296,13 @@ bool WhaleTracker_RustQueueSqlWrite(const char[] query, int userId, bool forceSy
     g_hRustSqlQueueUserIds.Push(userId);
     if (WhaleTracker_RustSqlIsOnlineQuery(query))
     {
-        LogMessage("[WhaleTracker] Rust SQL queued online query (queue=%d user=%d connected=%d awaiting_ack=%d): %s",
-            g_hRustSqlQueue.Length,
-            userId,
-            g_bRustSqlConnected ? 1 : 0,
-            g_bRustSqlAwaitingAck ? 1 : 0,
-            query);
+        if (WhaleTracker_RustSqlDebugEnabled())
+            LogMessage("[WhaleTracker] Rust SQL queued online query (queue=%d user=%d connected=%d awaiting_ack=%d): %s",
+                g_hRustSqlQueue.Length,
+                userId,
+                g_bRustSqlConnected ? 1 : 0,
+                g_bRustSqlAwaitingAck ? 1 : 0,
+                query);
     }
     WhaleTracker_RustFlushSqlBatch();
     return true;
@@ -335,7 +344,8 @@ void WhaleTracker_RustFlushSqlBatch()
     g_hRustSqlSocket.Send(out, pos);
     g_hRustSqlSocket.SetSendqueueEmptyCallback(WhaleTracker_RustOnSocketSendqueueEmpty);
     g_bRustSqlAwaitingAck = true;
-    LogMessage("[WhaleTracker] Rust SQL sent batch id=%d writes=%d bytes=%d queue_remaining=%d", batchId, sentCount, pos, g_hRustSqlQueue.Length - sentCount);
+    if (WhaleTracker_RustSqlDebugEnabled())
+        LogMessage("[WhaleTracker] Rust SQL sent batch id=%d writes=%d bytes=%d queue_remaining=%d", batchId, sentCount, pos, g_hRustSqlQueue.Length - sentCount);
 
     for (int i = 0; i < sentCount; i++)
     {
@@ -383,7 +393,8 @@ public void WhaleTracker_RustOnSocketSendqueueEmpty(Socket socket, any arg) {}
 public void WhaleTracker_RustOnSocketReceive(Socket socket, const char[] receiveData, const int dataSize, any arg)
 {
     if (dataSize <= 0) return;
-    LogMessage("[WhaleTracker] Rust SQL outlet recv bytes=%d", dataSize);
+    if (WhaleTracker_RustSqlDebugEnabled())
+        LogMessage("[WhaleTracker] Rust SQL outlet recv bytes=%d", dataSize);
     if (g_iRustSqlRecvBufferLen + dataSize >= sizeof(g_sRustSqlRecvBuffer))
     {
         LogError("[WhaleTracker] Rust SQL outlet receive buffer overflow");
@@ -429,13 +440,15 @@ void WhaleTracker_RustParseIncomingLines()
 void WhaleTracker_RustHandleBackendLine(const char[] line)
 {
     if (line[0] == '\0') return;
-    LogMessage("[WhaleTracker] Rust SQL outlet recv line: %s", line);
+    if (WhaleTracker_RustSqlDebugEnabled())
+        LogMessage("[WhaleTracker] Rust SQL outlet recv line: %s", line);
     if (StrContains(line, "\"type\":\"ack\"") != -1)
     {
         g_bRustSqlAwaitingAck = false;
-        LogMessage("[WhaleTracker] Rust SQL outlet ACK received; inflight=%d queued=%d",
-            (g_hRustSqlInflight != null) ? g_hRustSqlInflight.Length : 0,
-            (g_hRustSqlQueue != null) ? g_hRustSqlQueue.Length : 0);
+        if (WhaleTracker_RustSqlDebugEnabled())
+            LogMessage("[WhaleTracker] Rust SQL outlet ACK received; inflight=%d queued=%d",
+                (g_hRustSqlInflight != null) ? g_hRustSqlInflight.Length : 0,
+                (g_hRustSqlQueue != null) ? g_hRustSqlQueue.Length : 0);
         WhaleTracker_RustClearInflight();
         WhaleTracker_RustFlushSqlBatch();
         return;
@@ -445,6 +458,7 @@ void WhaleTracker_RustHandleBackendLine(const char[] line)
         g_bRustSqlAwaitingAck = false;
         LogError("[WhaleTracker] Rust SQL outlet backend error: %s", line);
         WhaleTracker_RustRequeueInflight();
-        LogMessage("[WhaleTracker] Rust SQL outlet requeued after backend error; queued=%d", (g_hRustSqlQueue != null) ? g_hRustSqlQueue.Length : 0);
+        if (WhaleTracker_RustSqlDebugEnabled())
+            LogMessage("[WhaleTracker] Rust SQL outlet requeued after backend error; queued=%d", (g_hRustSqlQueue != null) ? g_hRustSqlQueue.Length : 0);
     }
 }
