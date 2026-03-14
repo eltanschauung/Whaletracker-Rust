@@ -1,11 +1,34 @@
+#define WT_AIRSHOT_MIN_HEIGHT 170.0
+
+bool g_bPlayerTakenDirectHit[MAXPLAYERS + 1];
+
 public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)
 {
     int client = GetClientOfUserId(event.GetInt("userid"));
     if (!IsValidClient(client))
         return;
 
+    g_bPlayerTakenDirectHit[client] = false;
     ResetLifeCounters(g_Stats[client]);
     ResetLifeCounters(g_MapStats[client]);
+}
+
+public void OnEntityCreated(int entity, const char[] classname)
+{
+    if (entity <= MaxClients || !IsTrackedProjectileClassname(classname))
+    {
+        return;
+    }
+
+    SDKHook(entity, SDKHook_Touch, OnProjectileTouch);
+}
+
+public void OnProjectileTouch(int entity, int other)
+{
+    if (other > 0 && other <= MaxClients)
+    {
+        g_bPlayerTakenDirectHit[other] = true;
+    }
 }
 
 public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
@@ -94,10 +117,27 @@ public Action OnTakeDamage(int victim, int &attacker, int &inflictor, float &dam
     if (damage <= 0.0)
         return Plugin_Continue;
 
+    bool wasDirectHit = false;
+    if (IsValidClient(victim))
+    {
+        wasDirectHit = g_bPlayerTakenDirectHit[victim];
+        g_bPlayerTakenDirectHit[victim] = false;
+    }
+
     if (IsValidClient(attacker) && !IsFakeClient(attacker) && WhaleTracker_IsTrackingEnabled(attacker))
     {
-        if (IsProjectileAirshot(attacker, victim))
+        if (IsProjectileAirshot(attacker, victim, weapon, inflictor, wasDirectHit))
+        {
             g_Stats[attacker].totalAirshots += 1;
+            if (g_hAirshotForward != null)
+            {
+                Call_StartForward(g_hAirshotForward);
+                Call_PushCell(attacker);
+                Call_PushCell(victim);
+                int _ret;
+                Call_Finish(_ret);
+            }
+        }
 
         g_Stats[attacker].totalDamage += damageInt;
         g_MapStats[attacker].totalDamage += damageInt;
@@ -206,29 +246,110 @@ bool IsMedicDrop(int victim)
     return (GetEntPropFloat(medigun, Prop_Send, "m_flChargeLevel") >= 1.0);
 }
 
-bool IsProjectileAirshot(int attacker, int victim)
+bool IsProjectileAirshot(int attacker, int victim, int weapon, int inflictor, bool wasDirectHit)
 {
     if (!IsValidClient(attacker) || IsFakeClient(attacker) || !IsValidClient(victim) || IsFakeClient(victim))
         return false;
 
-    int weapon = GetPlayerWeaponSlot(attacker, 0);
-    if (weapon <= MaxClients || !IsValidEntity(weapon))
+    if (!wasDirectHit)
         return false;
 
     char classname[64];
-    GetEntityClassname(weapon, classname, sizeof(classname));
+    if (!ResolveDamageProjectileClassname(attacker, weapon, inflictor, classname, sizeof(classname)))
+        return false;
 
-    bool projectileWeapon = StrContains(classname, "rocketlauncher", false) != -1
-        || StrContains(classname, "grenadelauncher", false) != -1
-        || StrContains(classname, "pipeline", false) != -1
-        || StrContains(classname, "stickbomb", false) != -1;
-
-    if (!projectileWeapon)
+    if (!IsAirshotDamageClassname(classname))
         return false;
 
     int flags = GetEntityFlags(victim);
-    bool victimInAir = !(flags & FL_ONGROUND);
-    return victimInAir;
+    if ((flags & (FL_ONGROUND | FL_INWATER)) != 0)
+        return false;
+
+    float distance = DistanceAboveGroundBox(victim);
+    if (distance < WT_AIRSHOT_MIN_HEIGHT)
+        return false;
+
+    return true;
+}
+
+bool ResolveDamageProjectileClassname(int attacker, int weapon, int inflictor, char[] classname, int maxlen)
+{
+    if (GetNormalizedEntityClassname(inflictor, classname, maxlen) && IsTrackedProjectileClassname(classname))
+    {
+        return true;
+    }
+
+    if (GetNormalizedEntityClassname(weapon, classname, maxlen) && IsTrackedProjectileClassname(classname))
+    {
+        return true;
+    }
+
+    int activeWeapon = GetEntPropEnt(attacker, Prop_Send, "m_hActiveWeapon");
+    return GetNormalizedEntityClassname(activeWeapon, classname, maxlen) && IsTrackedProjectileClassname(classname);
+}
+
+bool GetNormalizedEntityClassname(int entity, char[] classname, int maxlen)
+{
+    classname[0] = '\0';
+    if (entity <= MaxClients || !IsValidEntity(entity))
+    {
+        return false;
+    }
+
+    GetEntityClassname(entity, classname, maxlen);
+    NormalizeWeaponClassname(classname, maxlen);
+    return classname[0] != '\0';
+}
+
+bool IsTrackedProjectileClassname(const char[] rawClassname)
+{
+    char classname[64];
+    strcopy(classname, sizeof(classname), rawClassname);
+    NormalizeWeaponClassname(classname, sizeof(classname));
+
+    return StrEqual(classname, "tf_projectile_rocket", false)
+        || StrEqual(classname, "tf_projectile_pipe", false)
+        || StrEqual(classname, "tf_projectile_pipe_remote", false)
+        || StrEqual(classname, "tf_projectile_healing_bolt", false);
+}
+
+bool IsAirshotDamageClassname(const char[] rawClassname)
+{
+    char classname[64];
+    strcopy(classname, sizeof(classname), rawClassname);
+    NormalizeWeaponClassname(classname, sizeof(classname));
+
+    return StrEqual(classname, "tf_projectile_rocket", false)
+        || StrEqual(classname, "tf_projectile_pipe", false)
+        || StrEqual(classname, "tf_projectile_healing_bolt", false);
+}
+
+float DistanceAboveGroundBox(int victim)
+{
+    float start[3];
+    float end[3];
+    float hullMins[3] = { -24.0, -24.0, 0.0 };
+    float hullMaxs[3] = { 24.0, 24.0, 0.0 };
+    float direction[3] = { 0.0, 0.0, -16384.0 };
+
+    GetClientAbsOrigin(victim, start);
+    AddVectors(direction, start, end);
+
+    Handle trace = TR_TraceHullFilterEx(start, end, hullMins, hullMaxs, MASK_PLAYERSOLID, TraceEntityFilterPlayer);
+
+    float distance = -1.0;
+    if (TR_DidHit(trace))
+    {
+        TR_GetEndPosition(end, trace);
+        distance = GetVectorDistance(start, end, false);
+    }
+    CloseHandle(trace);
+    return distance;
+}
+
+public bool TraceEntityFilterPlayer(int entity, int contentsMask)
+{
+    return entity > MaxClients || !entity;
 }
 
 void FormatMatchDuration(int seconds, char[] buffer, int maxlen)

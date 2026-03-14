@@ -1107,6 +1107,96 @@ int GetClientTfClass(int client)
     return classId;
 }
 
+void NormalizeWeaponClassname(char[] classname, int maxlen)
+{
+    if (StrEqual(classname, "tf_weapon_rocketlauncher_directhit", false)
+        || StrEqual(classname, "tf_weapon_particle_cannon", false))
+    {
+        strcopy(classname, maxlen, "tf_projectile_rocket");
+        return;
+    }
+
+    if (StrContains(classname, "tf_weapon_", false) == 0)
+    {
+        strcopy(classname, maxlen, classname[10]);
+    }
+
+    if (StrEqual(classname, "rocketlauncher", false) || StrEqual(classname, "rocketlauncher_directhit", false)
+        || StrEqual(classname, "particle_cannon", false))
+    {
+        strcopy(classname, maxlen, "tf_projectile_rocket");
+    }
+    else if (StrEqual(classname, "pipebomblauncher", false))
+    {
+        strcopy(classname, maxlen, "tf_projectile_pipe_remote");
+    }
+    else if (StrEqual(classname, "grenadelauncher", false))
+    {
+        strcopy(classname, maxlen, "tf_projectile_pipe");
+    }
+    else if (StrEqual(classname, "crossbow", false))
+    {
+        strcopy(classname, maxlen, "tf_projectile_healing_bolt");
+    }
+}
+
+int GetWeaponCategoryFromClassname(const char[] rawClassname)
+{
+    char classname[64];
+    strcopy(classname, sizeof(classname), rawClassname);
+    NormalizeWeaponClassname(classname, sizeof(classname));
+
+    if (StrEqual(classname, "shotgun_soldier", false)
+        || StrEqual(classname, "shotgun_primary", false)
+        || StrEqual(classname, "shotgun_hwg", false)
+        || StrEqual(classname, "shotgun_pyro", false))
+    {
+        return WeaponCategory_Shotguns;
+    }
+
+    if (StrEqual(classname, "scattergun", false)
+        || StrEqual(classname, "pep_brawler_blaster", false)
+        || StrEqual(classname, "handgun_scout_primary", false)
+        || StrEqual(classname, "soda_popper", false))
+    {
+        return WeaponCategory_Scatterguns;
+    }
+
+    if (StrEqual(classname, "pistol_scout", false)
+        || StrEqual(classname, "handgun_scout_secondary", false)
+        || StrEqual(classname, "pistol", false))
+    {
+        return WeaponCategory_Pistols;
+    }
+
+    if (StrEqual(classname, "tf_projectile_rocket", false))
+    {
+        return WeaponCategory_RocketLaunchers;
+    }
+
+    if (StrEqual(classname, "tf_projectile_pipe", false))
+    {
+        return WeaponCategory_GrenadeLaunchers;
+    }
+
+    if (StrEqual(classname, "tf_projectile_pipe_remote", false))
+    {
+        return WeaponCategory_StickyLaunchers;
+    }
+
+    if (StrEqual(classname, "sniperrifle", false) || StrEqual(classname, "smg", false))
+    {
+        return StrEqual(classname, "sniperrifle", false) ? WeaponCategory_Snipers : WeaponCategory_Pistols;
+    }
+
+    if (StrEqual(classname, "revolver", false))
+    {
+        return WeaponCategory_Revolvers;
+    }
+
+    return WeaponCategory_None;
+}
+
 int ResolveAccuracyWeaponCategory(int weapon)
 {
     if (weapon <= MaxClients || !IsValidEntity(weapon))
@@ -1122,10 +1212,20 @@ int ResolveAccuracyWeaponCategory(int weapon)
     int defIndex = GetEntProp(weapon, Prop_Send, "m_iItemDefinitionIndex");
     if (defIndex <= 0)
     {
-        return 0;
+        char classname[64];
+        GetEntityClassname(weapon, classname, sizeof(classname));
+        return GetWeaponCategoryFromClassname(classname);
     }
 
-    return GetWeaponCategoryFromDefIndex(defIndex);
+    int category = GetWeaponCategoryFromDefIndex(defIndex);
+    if (category != view_as<int>(WeaponCategory_None))
+    {
+        return category;
+    }
+
+    char classname[64];
+    GetEntityClassname(weapon, classname, sizeof(classname));
+    return GetWeaponCategoryFromClassname(classname);
 }
 
 bool TrackAccuracyEvent(int client, int weapon, bool isHit)
