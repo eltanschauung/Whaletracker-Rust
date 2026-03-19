@@ -226,7 +226,7 @@ public Action WhaleTracker_RustFlushTimer(Handle timer, any data)
     return Plugin_Continue;
 }
 
-void WhaleTracker_RustInit()
+public void WhaleTracker_RustInit()
 {
     g_hRustSqlOutletEnabled = CreateConVar("sm_whaletracker_rust_sql_outlet", "1", "Send WhaleTracker SQL writes to Rust TCP outlet (1=yes, 0=local DB writes only)");
     g_hRustSqlHost = CreateConVar("sm_whaletracker_rust_host", "127.0.0.1", "Rust SQL outlet host");
@@ -249,7 +249,7 @@ void WhaleTracker_RustInit()
     WhaleTracker_RustConnectSocket();
 }
 
-void WhaleTracker_RustShutdown()
+public void WhaleTracker_RustShutdown()
 {
     WhaleTracker_RustFlushSqlBatch();
     WhaleTracker_RustFlushPendingToLocal();
@@ -258,7 +258,7 @@ void WhaleTracker_RustShutdown()
     if (g_hRustSqlReconnectTimer != null) { CloseHandle(g_hRustSqlReconnectTimer); g_hRustSqlReconnectTimer = null; }
 }
 
-bool WhaleTracker_RustQueueSqlWrite(const char[] query, int userId, bool forceSync)
+public bool WhaleTracker_RustQueueSqlWrite(const char[] query, int userId, bool forceSync)
 {
     if (!WhaleTracker_UseRustSqlOutlet()) return false;
     if (forceSync || g_bShuttingDown)
@@ -268,6 +268,10 @@ bool WhaleTracker_RustQueueSqlWrite(const char[] query, int userId, bool forceSy
             if (WhaleTracker_RustSqlDebugEnabled())
                 LogMessage("[WhaleTracker] Rust SQL outlet bypassed online query (forceSync=%d shuttingDown=%d): %s", forceSync ? 1 : 0, g_bShuttingDown ? 1 : 0, query);
         }
+        return false;
+    }
+    if (!g_bRustSqlConnected || g_hRustSqlSocket == null)
+    {
         return false;
     }
 
@@ -308,7 +312,7 @@ bool WhaleTracker_RustQueueSqlWrite(const char[] query, int userId, bool forceSy
     return true;
 }
 
-void WhaleTracker_RustFlushSqlBatch()
+public void WhaleTracker_RustFlushSqlBatch()
 {
     if (!WhaleTracker_UseRustSqlOutlet() || !g_bRustSqlConnected || g_hRustSqlSocket == null || g_bRustSqlAwaitingAck) return;
     if (g_hRustSqlQueue == null || g_hRustSqlQueueUserIds == null || g_hRustSqlQueue.Length <= 0) return;
@@ -374,8 +378,10 @@ public void WhaleTracker_RustOnSocketConnected(Socket socket, any arg)
 
 public void WhaleTracker_RustOnSocketDisconnected(Socket socket, any arg)
 {
-    LogMessage("[WhaleTracker] Rust SQL outlet disconnected; requeueing inflight=%d", (g_hRustSqlInflight != null) ? g_hRustSqlInflight.Length : 0);
-    WhaleTracker_RustRequeueInflight();
+    LogMessage("[WhaleTracker] Rust SQL outlet disconnected; falling back to local DB for inflight=%d queued=%d",
+        (g_hRustSqlInflight != null) ? g_hRustSqlInflight.Length : 0,
+        (g_hRustSqlQueue != null) ? g_hRustSqlQueue.Length : 0);
+    WhaleTracker_RustFlushPendingToLocal();
     WhaleTracker_RustDisconnectSocket();
     WhaleTracker_RustScheduleReconnect();
 }
@@ -383,7 +389,7 @@ public void WhaleTracker_RustOnSocketDisconnected(Socket socket, any arg)
 public void WhaleTracker_RustOnSocketError(Socket socket, const int errorType, const int errorNum, any arg)
 {
     LogError("[WhaleTracker] Rust SQL outlet socket error type=%d errno=%d", errorType, errorNum);
-    WhaleTracker_RustRequeueInflight();
+    WhaleTracker_RustFlushPendingToLocal();
     WhaleTracker_RustDisconnectSocket();
     WhaleTracker_RustScheduleReconnect();
 }

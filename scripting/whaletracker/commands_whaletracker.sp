@@ -108,7 +108,7 @@ public Action Command_ShowPoints(int client, int args)
 
     CPrintToChatAll("{gold}[Whaletracker]{default} {%s}%s{default}'s Points: %d, Rank #%d", colorTag, playerName, points, rank);
     CPrintToChat(client, "Kill/Death ratio: %.2f", lifetimeKd);
-    CPrintToChat(client, "Calculation: {lightgreen}((damage / 200) + (healing / 400) + (kills + floor(assists * 0.5)) + backstabs + headshots){default} / {axis}(deaths){default} * 10000");
+    CPrintToChat(client, "Calculation: {lightgreen}((damage / 200) + (healing / 400) + (kills + floor(assists * 0.5)) + backstabs + headshots + (ubers * 10)){default} / {axis}(deaths){default} * 10000");
     CPrintToChat(client, "Use {gold}!ranks{default} to view the leaderboard!");
     CacheWhalePointsForClient(target, points, rank, colorTag);
 
@@ -370,6 +370,7 @@ int GetWhalePointsForClient(int client)
     int assists;
     int backstabs;
     int headshots;
+    int totalUbers;
     int damage;
     int healing;
 
@@ -380,6 +381,7 @@ int GetWhalePointsForClient(int client)
         assists = g_Stats[client].totalAssists;
         backstabs = g_Stats[client].totalBackstabs;
         headshots = g_Stats[client].totalHeadshots;
+        totalUbers = g_Stats[client].totalUbers;
         damage = g_Stats[client].totalDamage;
         healing = g_Stats[client].totalHealing;
     }
@@ -390,7 +392,7 @@ int GetWhalePointsForClient(int client)
 
         char query[256];
         Format(query, sizeof(query),
-            "SELECT kills, deaths, assists, backstabs, headshots, damage_dealt, healing "
+            "SELECT kills, deaths, assists, backstabs, headshots, total_ubers, damage_dealt, healing "
             ... "FROM whaletracker WHERE steamid = '%s' LIMIT 1",
             escapedSteamId);
 
@@ -414,8 +416,9 @@ int GetWhalePointsForClient(int client)
         assists = results.FetchInt(2);
         backstabs = results.FetchInt(3);
         headshots = results.FetchInt(4);
-        damage = results.FetchInt(5);
-        healing = results.FetchInt(6);
+        totalUbers = results.FetchInt(5);
+        damage = results.FetchInt(6);
+        healing = results.FetchInt(7);
         delete results;
     }
 
@@ -423,6 +426,7 @@ int GetWhalePointsForClient(int client)
     int safeAssists = (assists > 0) ? assists : 0;
     int safeBackstabs = (backstabs > 0) ? backstabs : 0;
     int safeHeadshots = (headshots > 0) ? headshots : 0;
+    int safeTotalUbers = (totalUbers > 0) ? totalUbers : 0;
     int safeDamage = (damage > 0) ? damage : 0;
     int safeDeaths = (deaths > 0) ? deaths : 0;
     int safeHealing = (healing > 0) ? healing : 0;
@@ -439,6 +443,7 @@ int GetWhalePointsForClient(int client)
     positive += float(RoundToFloor(float(safeAssists) * 0.5));
     positive += float(safeBackstabs);
     positive += float(safeHeadshots);
+    positive += float(safeTotalUbers * 10);
     if (positive < 0.0)
     {
         positive = 0.0;

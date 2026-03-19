@@ -15,7 +15,7 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
 
 public void OnEntityCreated(int entity, const char[] classname)
 {
-    if (entity <= MaxClients || !IsTrackedProjectileClassname(classname))
+    if (entity <= MaxClients || !IsSupstatsDirectHitProjectileClassname(classname))
     {
         return;
     }
@@ -126,7 +126,7 @@ public Action OnTakeDamage(int victim, int &attacker, int &inflictor, float &dam
 
     if (IsValidClient(attacker) && !IsFakeClient(attacker) && WhaleTracker_IsTrackingEnabled(attacker))
     {
-        if (IsProjectileAirshot(attacker, victim, weapon, inflictor, wasDirectHit))
+        if (IsSupstatsAirshot(attacker, victim, weapon, wasDirectHit))
         {
             g_Stats[attacker].totalAirshots += 1;
             if (g_hAirshotForward != null)
@@ -246,82 +246,52 @@ bool IsMedicDrop(int victim)
     return (GetEntPropFloat(medigun, Prop_Send, "m_flChargeLevel") >= 1.0);
 }
 
-bool IsProjectileAirshot(int attacker, int victim, int weapon, int inflictor, bool wasDirectHit)
+bool IsSupstatsAirshot(int attacker, int victim, int weapon, bool wasDirectHit)
 {
     if (!IsValidClient(attacker) || IsFakeClient(attacker) || !IsValidClient(victim) || IsFakeClient(victim))
         return false;
 
-    if (!wasDirectHit)
+    int primary = GetPlayerWeaponSlot(attacker, 0);
+    if (primary <= MaxClients || primary != weapon)
+    {
         return false;
+    }
 
-    char classname[64];
-    if (!ResolveDamageProjectileClassname(attacker, weapon, inflictor, classname, sizeof(classname)))
-        return false;
+    TFClassType attackerClass = TF2_GetPlayerClass(attacker);
+    if ((attackerClass == TFClass_Soldier || attackerClass == TFClass_DemoMan) && wasDirectHit)
+    {
+        return IsVictimAirshotEligible(victim);
+    }
 
-    if (!IsAirshotDamageClassname(classname))
-        return false;
+    if (attackerClass == TFClass_Medic)
+    {
+        char classname[64];
+        GetEntityClassname(weapon, classname, sizeof(classname));
+        if (StrEqual(classname, "tf_weapon_crossbow", false))
+        {
+            return IsVictimAirshotEligible(victim);
+        }
+    }
 
+    return false;
+}
+
+bool IsVictimAirshotEligible(int victim)
+{
     int flags = GetEntityFlags(victim);
     if ((flags & (FL_ONGROUND | FL_INWATER)) != 0)
+    {
         return false;
+    }
 
     float distance = DistanceAboveGroundBox(victim);
-    if (distance < WT_AIRSHOT_MIN_HEIGHT)
-        return false;
-
-    return true;
+    return distance >= WT_AIRSHOT_MIN_HEIGHT;
 }
 
-bool ResolveDamageProjectileClassname(int attacker, int weapon, int inflictor, char[] classname, int maxlen)
+bool IsSupstatsDirectHitProjectileClassname(const char[] classname)
 {
-    if (GetNormalizedEntityClassname(inflictor, classname, maxlen) && IsTrackedProjectileClassname(classname))
-    {
-        return true;
-    }
-
-    if (GetNormalizedEntityClassname(weapon, classname, maxlen) && IsTrackedProjectileClassname(classname))
-    {
-        return true;
-    }
-
-    int activeWeapon = GetEntPropEnt(attacker, Prop_Send, "m_hActiveWeapon");
-    return GetNormalizedEntityClassname(activeWeapon, classname, maxlen) && IsTrackedProjectileClassname(classname);
-}
-
-bool GetNormalizedEntityClassname(int entity, char[] classname, int maxlen)
-{
-    classname[0] = '\0';
-    if (entity <= MaxClients || !IsValidEntity(entity))
-    {
-        return false;
-    }
-
-    GetEntityClassname(entity, classname, maxlen);
-    NormalizeWeaponClassname(classname, maxlen);
-    return classname[0] != '\0';
-}
-
-bool IsTrackedProjectileClassname(const char[] rawClassname)
-{
-    char classname[64];
-    strcopy(classname, sizeof(classname), rawClassname);
-    NormalizeWeaponClassname(classname, sizeof(classname));
-
     return StrEqual(classname, "tf_projectile_rocket", false)
-        || StrEqual(classname, "tf_projectile_pipe", false)
-        || StrEqual(classname, "tf_projectile_pipe_remote", false)
-        || StrEqual(classname, "tf_projectile_healing_bolt", false);
-}
-
-bool IsAirshotDamageClassname(const char[] rawClassname)
-{
-    char classname[64];
-    strcopy(classname, sizeof(classname), rawClassname);
-    NormalizeWeaponClassname(classname, sizeof(classname));
-
-    return StrEqual(classname, "tf_projectile_rocket", false)
-        || StrEqual(classname, "tf_projectile_pipe", false)
-        || StrEqual(classname, "tf_projectile_healing_bolt", false);
+        || StrEqual(classname, "tf_projectile_pipe", false);
 }
 
 float DistanceAboveGroundBox(int victim)

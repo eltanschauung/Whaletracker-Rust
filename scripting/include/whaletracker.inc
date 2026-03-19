@@ -34,6 +34,7 @@ void ResetStatsStruct(WhaleStats stats, bool resetIdentity)
     stats.totalUbers = 0;
     stats.totalMedicDrops = 0;
     stats.totalAirshots = 0;
+    stats.totalMarketGardenHits = 0;
     stats.totalHeadshots = 0;
     stats.totalBackstabs = 0;
     stats.totalAssists = 0;
@@ -504,6 +505,7 @@ void SnapshotFromStats(const WhaleStats stats, int data[MATCH_STAT_COUNT])
     data[MatchStat_MedicDrops] = stats.totalMedicDrops;
     data[MatchStat_UberDrops] = stats.totalUberDrops;
     data[MatchStat_Airshots] = stats.totalAirshots;
+    data[MatchStat_MarketGardenHits] = stats.totalMarketGardenHits;
     data[MatchStat_BestStreak] = stats.bestKillstreak;
     data[MatchStat_BestUbersLife] = stats.bestUbersLife;
 }
@@ -523,6 +525,7 @@ void MergeSnapshotArrays(int base[MATCH_STAT_COUNT], const int delta[MATCH_STAT_
     base[MatchStat_MedicDrops] += delta[MatchStat_MedicDrops];
     base[MatchStat_UberDrops] += delta[MatchStat_UberDrops];
     base[MatchStat_Airshots] += delta[MatchStat_Airshots];
+    base[MatchStat_MarketGardenHits] += delta[MatchStat_MarketGardenHits];
 
     if (delta[MatchStat_BestStreak] > base[MatchStat_BestStreak])
     {
@@ -591,6 +594,7 @@ void ApplySnapshotToStats(WhaleStats stats, const int data[MATCH_STAT_COUNT])
     stats.totalMedicDrops = data[MatchStat_MedicDrops];
     stats.totalUberDrops = data[MatchStat_UberDrops];
     stats.totalAirshots = data[MatchStat_Airshots];
+    stats.totalMarketGardenHits = data[MatchStat_MarketGardenHits];
     stats.bestKillstreak = data[MatchStat_BestStreak];
     stats.bestUbersLife = data[MatchStat_BestUbersLife];
     stats.loaded = true;
@@ -821,8 +825,8 @@ void InsertPlayerLogRecord(const int data[MATCH_STAT_COUNT], const char[] steamI
     char query[SAVE_QUERY_MAXLEN];
     Format(query, sizeof(query),
         "INSERT INTO whaletracker_log_players "
-        ... "(log_id, steamid, personaname, kills, deaths, assists, damage, damage_taken, healing, headshots, backstabs, total_ubers, playtime, medic_drops, uber_drops, airshots, best_streak, best_ubers_life, last_updated) "
-        ... "VALUES ('%s', '%s', '%s', %d, %d, %d, %d, %d, %d, %d, %d, %d,  %d, %d, %d, %d, %d, %d, %d) "
+        ... "(log_id, steamid, personaname, kills, deaths, assists, damage, damage_taken, healing, headshots, backstabs, total_ubers, playtime, medic_drops, uber_drops, airshots, marketGardenHits, best_streak, best_ubers_life, last_updated) "
+        ... "VALUES ('%s', '%s', '%s', %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d) "
         ... "ON DUPLICATE KEY UPDATE "
         ... "personaname = VALUES(personaname), "
         ... "kills = VALUES(kills), "
@@ -838,6 +842,7 @@ void InsertPlayerLogRecord(const int data[MATCH_STAT_COUNT], const char[] steamI
         ... "medic_drops = VALUES(medic_drops), "
         ... "uber_drops = VALUES(uber_drops), "
         ... "airshots = VALUES(airshots), "
+        ... "marketGardenHits = VALUES(marketGardenHits), "
         ... "best_streak = VALUES(best_streak), "
         ... "best_ubers_life = VALUES(best_ubers_life), "
         ... "last_updated = VALUES(last_updated)",
@@ -857,6 +862,7 @@ void InsertPlayerLogRecord(const int data[MATCH_STAT_COUNT], const char[] steamI
         data[MatchStat_MedicDrops],
         data[MatchStat_UberDrops],
         data[MatchStat_Airshots],
+        data[MatchStat_MarketGardenHits],
         data[MatchStat_BestStreak],
         data[MatchStat_BestUbersLife],
         timestamp);
