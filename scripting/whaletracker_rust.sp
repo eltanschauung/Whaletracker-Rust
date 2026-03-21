@@ -21,7 +21,7 @@
 #define DB_CONFIG_DEFAULT "default"
 #define SAVE_QUERY_MAXLEN 4096
 #define MAX_CONCURRENT_SAVE_QUERIES 4
-#define WHALE_POINTS_SQL_EXPR "CEIL((((GREATEST(damage_dealt,0) / 200.0) + (GREATEST(healing,0) / 400.0) + GREATEST(kills,0) + FLOOR(GREATEST(assists,0) * 0.5) + GREATEST(backstabs,0) + GREATEST(headshots,0) + (GREATEST(marketGardenHits,0) * 10) + (GREATEST(total_ubers,0) * 10)) * 10000.0) / GREATEST(GREATEST(deaths,0) + (GREATEST(damage_taken,0) / 200.0), 1))"
+#define WHALE_POINTS_SQL_EXPR "CEIL((((GREATEST(damage_dealt,0) / 200.0) + (GREATEST(healing,0) / 400.0) + GREATEST(kills,0) + FLOOR(GREATEST(assists,0) * 0.5) + GREATEST(backstabs,0) + GREATEST(headshots,0) + (GREATEST(marketGardenHits,0) * 5) + (GREATEST(total_ubers,0) * 10)) * 10000.0) / GREATEST(GREATEST(deaths,0) + (GREATEST(damage_taken,0) / 500.0), 1))"
 #define WHALE_POINTS_MIN_KD_SUM 1000
 #define WHALE_LEADERBOARD_PAGE_SIZE 10
 #define WT_PUBLIC_IP_MODE_STEAMWORKS 0
@@ -122,6 +122,7 @@ Handle g_hPeriodicSaveTimer = null;
 bool g_bTrackEligible[MAXPLAYERS + 1];
 int g_iDamageGate[MAXPLAYERS + 1];
 bool g_bPlayerTakenDirectHit[MAXPLAYERS + 1];
+bool g_bInExplosiveJump[MAXPLAYERS + 1];
 
 Database g_hDatabase = null;
 ConVar g_CvarDatabase = null;
@@ -1280,19 +1281,36 @@ static int ResolveAccuracyWeaponCategory(int weapon)
     return GetWeaponCategoryFromClassname(classname);
 }
 
-static bool IsMarketGardenerCriticalHit(int weapon, int damageType)
+static int GetWeaponDefIndexSafe(int weapon)
 {
-    if ((damageType & DMG_CRIT) == 0)
-    {
-        return false;
-    }
-
     if (weapon <= MaxClients || !IsValidEntity(weapon) || !HasEntProp(weapon, Prop_Send, "m_iItemDefinitionIndex"))
     {
+        return -1;
+    }
+
+    return GetEntProp(weapon, Prop_Send, "m_iItemDefinitionIndex");
+}
+
+static bool IsMarketGardenerWeapon(int weapon)
+{
+    return GetWeaponDefIndexSafe(weapon) == WT_MARKET_GARDENER_DEF_INDEX;
+}
+
+static bool IsMarketGardenerHit(int attacker, int weapon)
+{
+    if (!IsValidClient(attacker) || TF2_GetPlayerClass(attacker) != TFClass_Soldier || !g_bInExplosiveJump[attacker])
+    {
         return false;
     }
 
-    return GetEntProp(weapon, Prop_Send, "m_iItemDefinitionIndex") == WT_MARKET_GARDENER_DEF_INDEX;
+    if (IsMarketGardenerWeapon(weapon))
+    {
+        return true;
+    }
+
+    int activeWeapon = GetEntPropEnt(attacker, Prop_Send, "m_hActiveWeapon");
+    int meleeWeapon = GetPlayerWeaponSlot(attacker, TFWeaponSlot_Melee);
+    return activeWeapon == meleeWeapon && IsMarketGardenerWeapon(activeWeapon);
 }
 
 static void NormalizeWeaponClassname(char[] classname, int maxlen)
@@ -1752,6 +1770,10 @@ public void OnPluginStart()
     HookEvent("player_spawn", Event_PlayerSpawn, EventHookMode_Post);
     HookEvent("player_healed", Event_PlayerHealed, EventHookMode_Post);
     HookEvent("player_chargedeployed", Event_UberDeployed, EventHookMode_Post);
+    HookEvent("rocket_jump", Event_ExplosiveJump, EventHookMode_Pre);
+    HookEvent("sticky_jump", Event_ExplosiveJump, EventHookMode_Pre);
+    HookEvent("rocket_jump_landed", Event_ExplosiveJumpLanded, EventHookMode_Pre);
+    HookEvent("sticky_jump_landed", Event_ExplosiveJumpLanded, EventHookMode_Pre);
 
     RegConsoleCmd("sm_whalestats", Command_ShowStats, "Show your Whale Tracker statistics.");
     RegConsoleCmd("sm_stats", Command_ShowStats, "Show your Whale Tracker statistics.");
@@ -2965,8 +2987,31 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
         return;
 
     g_bPlayerTakenDirectHit[client] = false;
+    g_bInExplosiveJump[client] = false;
     ResetLifeCounters(g_Stats[client]);
     ResetLifeCounters(g_MapStats[client]);
+}
+
+public void Event_ExplosiveJump(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    if (!IsValidClient(client))
+    {
+        return;
+    }
+
+    g_bInExplosiveJump[client] = true;
+}
+
+public void Event_ExplosiveJumpLanded(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    if (!IsValidClient(client))
+    {
+        return;
+    }
+
+    g_bInExplosiveJump[client] = false;
 }
 
 public void OnEntityCreated(int entity, const char[] classname)
@@ -3090,7 +3135,7 @@ public Action OnTakeDamage(int victim, int &attacker, int &inflictor, float &dam
             }
         }
 
-        if (IsMarketGardenerCriticalHit(weapon, damagetype))
+        if (IsMarketGardenerHit(attacker, weapon))
         {
             g_Stats[attacker].totalMarketGardenHits += 1;
             g_MapStats[attacker].totalMarketGardenHits += 1;
@@ -3503,7 +3548,7 @@ public Action Command_ShowPoints(int client, int args)
 
     CPrintToChatAll("{gold}[Whaletracker]{default} {%s}%s{default}'s Points: %d, Rank #%d", colorTag, playerName, points, rank);
     CPrintToChat(client, "Kill/Death ratio: %.2f", lifetimeKd);
-    CPrintToChat(client, "Calculation: {lightgreen}((damage / 200) + (healing / 400) + (kills + floor(assists * 0.5)) + backstabs + headshots + (market gardens * 10) + (ubers * 10)){default} / {axis}(deaths + (damage taken / 200)){default} * 10000");
+    CPrintToChat(client, "Calculation: {lightgreen}((damage / 200) + (healing / 400) + (kills + floor(assists * 0.5)) + backstabs + headshots + (market gardens * 5) + (ubers * 10)){default} / {axis}(deaths + (damage taken / 500)){default} * 10000");
     CPrintToChat(client, "Use {gold}!ranks{default} to view the leaderboard!");
     CacheWhalePointsForClient(target, points, rank, colorTag);
 
@@ -3849,7 +3894,7 @@ static int GetWhalePointsForClient(int client)
     positive += float(RoundToFloor(float(safeAssists) * 0.5));
     positive += float(safeBackstabs);
     positive += float(safeHeadshots);
-    positive += float(safeMarketGardenHits * 10);
+    positive += float(safeMarketGardenHits * 5);
     positive += float(safeTotalUbers * 10);
     if (positive < 0.0)
     {
@@ -3860,7 +3905,7 @@ static int GetWhalePointsForClient(int client)
         positive = 2147483000.0;
     }
 
-    int denominatorBase = RoundToFloor(safeDeaths + safeDamageTaken / 200.0);
+    int denominatorBase = RoundToFloor(safeDeaths + safeDamageTaken / 500.0);
     if (denominatorBase < 1)
     {
         denominatorBase = 1;

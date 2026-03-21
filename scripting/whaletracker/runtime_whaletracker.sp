@@ -115,6 +115,9 @@ public void OnPluginStart()
     RegConsoleCmd("sm_points", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_pos", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_pts", Command_ShowPoints, "Show your WhalePoints total.");
+    RegConsoleCmd("sm_markets", Command_ShowMarketGardens, "Show your market garden total.");
+    RegConsoleCmd("sm_mg", Command_ShowMarketGardens, "Show your market garden total.");
+    RegConsoleCmd("sm_gardens", Command_ShowMarketGardens, "Show your market garden total.");
     RegConsoleCmd("sm_rank", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_ps", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_ranks", Command_ShowLeaderboard, "Show WhaleTracker leaderboard page.");

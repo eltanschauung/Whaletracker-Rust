@@ -115,6 +115,17 @@ public Action Command_ShowPoints(int client, int args)
     return Plugin_Handled;
 }
 
+public Action Command_ShowMarketGardens(int client, int args)
+{
+    if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client))
+    {
+        return Plugin_Handled;
+    }
+
+    CPrintToChat(client, "{green}[WhaleTracker]{default} Your market gardens: {gold}%d", g_Stats[client].totalMarketGardenHits);
+    return Plugin_Handled;
+}
+
 public Action Command_ShowLeaderboard(int client, int args)
 {
     if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client))
