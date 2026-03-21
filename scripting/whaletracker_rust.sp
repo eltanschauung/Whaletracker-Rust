@@ -1780,6 +1780,9 @@ public void OnPluginStart()
     RegConsoleCmd("sm_points", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_pos", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_pts", Command_ShowPoints, "Show your WhalePoints total.");
+    RegConsoleCmd("sm_markets", Command_ShowMarketGardens, "Show your market garden total.");
+    RegConsoleCmd("sm_mg", Command_ShowMarketGardens, "Show your market garden total.");
+    RegConsoleCmd("sm_gardens", Command_ShowMarketGardens, "Show your market garden total.");
     RegConsoleCmd("sm_rank", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_ps", Command_ShowPoints, "Show your WhalePoints total.");
     RegConsoleCmd("sm_ranks", Command_ShowLeaderboard, "Show WhaleTracker leaderboard page.");
@@ -3552,6 +3555,17 @@ public Action Command_ShowPoints(int client, int args)
     CPrintToChat(client, "Use {gold}!ranks{default} to view the leaderboard!");
     CacheWhalePointsForClient(target, points, rank, colorTag);
 
+    return Plugin_Handled;
+}
+
+public Action Command_ShowMarketGardens(int client, int args)
+{
+    if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client))
+    {
+        return Plugin_Handled;
+    }
+
+    CPrintToChat(client, "{green}[WhaleTracker]{default} Your market gardens: {gold}%d", g_Stats[client].totalMarketGardenHits);
     return Plugin_Handled;
 }
 
