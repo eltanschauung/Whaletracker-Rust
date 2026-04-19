@@ -20,7 +20,10 @@ const DEFAULT_POINTS_CACHE_OWNER_PORT: u16 = 28017;
 const DEFAULT_POINTS_CACHE_DEBOUNCE_MS: u64 = 3000;
 const DEFAULT_POINTS_CACHE_POLL_MS: u64 = 1000;
 const DEFAULT_POINTS_CACHE_TOUCH_MS: u64 = 1000;
+const DEFAULT_SCHEMA_POLL_MS: u64 = 1000;
+const WHALETRACKER_SCHEMA_VERSION: u32 = 2;
 const POINTS_CACHE_STATE_KEY: &str = "global";
+const SCHEMA_VERSION_TABLE: &str = "whaletracker_schema_migrations";
 const WHALE_RANK_MIN_KD_SUM: i32 = 200;
 const WHALE_RANK_MIN_PLAYTIME_SECONDS: i32 = 10800;
 const WHALE_POINTS_SQL_EXPR: &str = r#"ROUND(1000.0 * SQRT(((CASE WHEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) > 0 THEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) ELSE 1 END)) / (((CASE WHEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) > 0 THEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) ELSE 1 END)) + 400.0)) * (((CASE WHEN playtime > 0 THEN playtime ELSE 0 END) / 3600.0) / (((CASE WHEN playtime > 0 THEN playtime ELSE 0 END) / 3600.0) + 20.0)) * ((5.0 * (((CASE WHEN kills > 0 THEN kills ELSE 0 END) + ((CASE WHEN assists > 0 THEN assists ELSE 0 END) * 0.35)) / ((CASE WHEN deaths > 0 THEN deaths ELSE 0 END) + 20.0))) + LN(1.0 + ((CASE WHEN damage_dealt > 0 THEN damage_dealt ELSE 0 END) / (150.0 * ((CASE WHEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) > 0 THEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) ELSE 1 END))))) + (0.60 * LN(1.0 + ((CASE WHEN healing > 0 THEN healing ELSE 0 END) / (100.0 * ((CASE WHEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) > 0 THEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) ELSE 1 END)))))) + (0.90 * LN(1.0 + ((60.0 * (CASE WHEN total_ubers > 0 THEN total_ubers ELSE 0 END)) / ((CASE WHEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) > 0 THEN ((CASE WHEN kills > 0 THEN kills ELSE 0 END) + (CASE WHEN deaths > 0 THEN deaths ELSE 0 END)) ELSE 1 END)))))))"#;
@@ -138,6 +141,493 @@ fn open_mysql_pool(cfg: &DbConfig) -> Result<mysql::Pool, String> {
     mysql::Pool::new(builder).map_err(|e| e.to_string())
 }
 
+#[derive(Debug)]
+struct Migration {
+    version: u32,
+    name: &'static str,
+    statements: Vec<String>,
+}
+
+struct SchemaManager {
+    bind_port: u16,
+    owner_port: u16,
+    poll_ms: u64,
+    pool: mysql::Pool,
+}
+
+impl SchemaManager {
+    fn new(
+        db_cfg: &DbConfig,
+        bind_port: u16,
+        owner_port: u16,
+        poll_ms: u64,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            bind_port,
+            owner_port,
+            poll_ms: poll_ms.max(1),
+            pool: open_mysql_pool(db_cfg)?,
+        })
+    }
+
+    fn is_owner(&self) -> bool {
+        self.bind_port > 0 && self.bind_port == self.owner_port
+    }
+
+    fn ensure_version_table(&self) -> Result<(), String> {
+        let mut conn = self.pool.get_conn().map_err(|e| e.to_string())?;
+        conn.query_drop(format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+             version INTEGER PRIMARY KEY,\
+             name VARCHAR(128) NOT NULL,\
+             applied_at BIGINT DEFAULT 0\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            SCHEMA_VERSION_TABLE
+        ))
+        .map_err(|e| e.to_string())
+    }
+
+    fn current_version(&self) -> Result<u32, String> {
+        self.ensure_version_table()?;
+        let mut conn = self.pool.get_conn().map_err(|e| e.to_string())?;
+        let sql = format!("SELECT COALESCE(MAX(version), 0) FROM {}", SCHEMA_VERSION_TABLE);
+        let version = conn
+            .query_first::<u32, _>(sql)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        Ok(version)
+    }
+
+    fn prepare(&self) -> Result<(), String> {
+        if self.is_owner() {
+            println!(
+                "[schema] bind_port={} owner_port={} role=owner target_version={}",
+                self.bind_port, self.owner_port, WHALETRACKER_SCHEMA_VERSION
+            );
+            self.apply_migrations()
+        } else {
+            println!(
+                "[schema] bind_port={} owner_port={} role=follower target_version={}",
+                self.bind_port, self.owner_port, WHALETRACKER_SCHEMA_VERSION
+            );
+            self.wait_until_ready()
+        }
+    }
+
+    fn apply_migrations(&self) -> Result<(), String> {
+        self.ensure_version_table()?;
+        let current = self.current_version()?;
+        let migrations = schema_migrations();
+
+        for migration in migrations.into_iter().filter(|m| m.version > current) {
+            println!(
+                "[schema] apply start version={} name={}",
+                migration.version, migration.name
+            );
+            let mut conn = self.pool.get_conn().map_err(|e| e.to_string())?;
+            for statement in &migration.statements {
+                conn.query_drop(statement).map_err(|e| e.to_string())?;
+            }
+            conn.exec_drop(
+                format!(
+                    "INSERT INTO {} (version, name, applied_at) VALUES (:version, :name, :applied_at)",
+                    SCHEMA_VERSION_TABLE
+                ),
+                params! {
+                    "version" => migration.version,
+                    "name" => migration.name,
+                    "applied_at" => now_ms_u64(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            println!(
+                "[schema] apply ok version={} name={}",
+                migration.version, migration.name
+            );
+        }
+
+        let final_version = self.current_version()?;
+        if final_version < WHALETRACKER_SCHEMA_VERSION {
+            return Err(format!(
+                "schema version {} below required {} after apply",
+                final_version, WHALETRACKER_SCHEMA_VERSION
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_until_ready(&self) -> Result<(), String> {
+        loop {
+            match self.current_version() {
+                Ok(version) if version >= WHALETRACKER_SCHEMA_VERSION => return Ok(()),
+                Ok(_) => {}
+                Err(err) => eprintln!("[schema] wait retry: {}", err),
+            }
+            thread::sleep(Duration::from_millis(self.poll_ms));
+        }
+    }
+}
+
+fn build_create_table_sql(name: &str, data_columns: Vec<String>, key_defs: Vec<String>) -> String {
+    let mut parts = data_columns;
+    parts.extend(key_defs);
+    format!(
+        "CREATE TABLE IF NOT EXISTS `{}` ({}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        name,
+        parts.join(", ")
+    )
+}
+
+fn push_add_columns(statements: &mut Vec<String>, table: &str, columns: &[String]) {
+    for column in columns {
+        statements.push(format!(
+            "ALTER TABLE `{}` ADD COLUMN IF NOT EXISTS {}",
+            table, column
+        ));
+    }
+}
+
+fn class_slugs() -> [&'static str; 9] {
+    [
+        "scout",
+        "sniper",
+        "soldier",
+        "demoman",
+        "medic",
+        "heavy",
+        "pyro",
+        "spy",
+        "engineer",
+    ]
+}
+
+fn weapon_category_columns() -> Vec<String> {
+    let mut columns = Vec::new();
+    for slug in [
+        "shotguns",
+        "scatterguns",
+        "pistols",
+        "rocketlaunchers",
+        "grenadelaunchers",
+        "stickylaunchers",
+        "snipers",
+        "revolvers",
+    ] {
+        columns.push(format!("`shots_{}` INTEGER DEFAULT 0", slug));
+        columns.push(format!("`hits_{}` INTEGER DEFAULT 0", slug));
+    }
+    columns
+}
+
+fn per_class_columns() -> Vec<String> {
+    let mut columns = vec!["`classes_mask` INTEGER DEFAULT 0".to_string()];
+    for slug in class_slugs() {
+        columns.push(format!("`shots_{}` INTEGER DEFAULT 0", slug));
+        columns.push(format!("`hits_{}` INTEGER DEFAULT 0", slug));
+    }
+    columns
+}
+
+fn weapon_slot_columns(max_slots: usize) -> Vec<String> {
+    let mut columns = Vec::new();
+    for slot in 1..=max_slots {
+        columns.push(format!("`weapon{}_name` VARCHAR(128) DEFAULT ''", slot));
+        columns.push(format!("`weapon{}_shots` INTEGER DEFAULT 0", slot));
+        columns.push(format!("`weapon{}_hits` INTEGER DEFAULT 0", slot));
+        columns.push(format!("`weapon{}_damage` INTEGER DEFAULT 0", slot));
+        columns.push(format!("`weapon{}_defindex` INTEGER DEFAULT 0", slot));
+    }
+    columns
+}
+
+fn online_weapon_slot_columns(max_slots: usize) -> Vec<String> {
+    let mut columns = Vec::new();
+    for slot in 1..=max_slots {
+        columns.push(format!("`weapon{}_name` VARCHAR(64) DEFAULT ''", slot));
+        columns.push(format!("`weapon{}_accuracy` FLOAT DEFAULT 0", slot));
+        columns.push(format!("`weapon{}_shots` INTEGER DEFAULT 0", slot));
+        columns.push(format!("`weapon{}_hits` INTEGER DEFAULT 0", slot));
+    }
+    columns
+}
+
+fn schema_migrations() -> Vec<Migration> {
+    let mut whaletracker_columns = vec![
+        "`steamid` VARCHAR(32) NOT NULL".to_string(),
+        "`first_seen` INTEGER DEFAULT NULL".to_string(),
+        "`kills` INTEGER DEFAULT 0".to_string(),
+        "`deaths` INTEGER DEFAULT 0".to_string(),
+        "`shots` INTEGER DEFAULT 0".to_string(),
+        "`hits` INTEGER DEFAULT 0".to_string(),
+        "`healing` INTEGER DEFAULT 0".to_string(),
+        "`total_ubers` INTEGER DEFAULT 0".to_string(),
+        "`best_ubers_life` INTEGER DEFAULT 0".to_string(),
+        "`medic_drops` INTEGER DEFAULT 0".to_string(),
+        "`uber_drops` INTEGER DEFAULT 0".to_string(),
+        "`airshots` INTEGER DEFAULT 0".to_string(),
+        "`bonusPoints` INTEGER DEFAULT 0".to_string(),
+        "`medicKills` INTEGER DEFAULT 0".to_string(),
+        "`heavyKills` INTEGER DEFAULT 0".to_string(),
+        "`marketGardenHits` INTEGER DEFAULT 0".to_string(),
+        "`headshots` INTEGER DEFAULT 0".to_string(),
+        "`backstabs` INTEGER DEFAULT 0".to_string(),
+        "`best_headshots_life` INTEGER DEFAULT 0".to_string(),
+        "`best_backstabs_life` INTEGER DEFAULT 0".to_string(),
+        "`best_kills_life` INTEGER DEFAULT 0".to_string(),
+        "`best_killstreak` INTEGER DEFAULT 0".to_string(),
+        "`best_score_life` INTEGER DEFAULT 0".to_string(),
+        "`assists` INTEGER DEFAULT 0".to_string(),
+        "`best_assists_life` INTEGER DEFAULT 0".to_string(),
+        "`playtime` INTEGER DEFAULT 0".to_string(),
+        "`is_admin` TINYINT DEFAULT 0".to_string(),
+        "`damage_dealt` INTEGER DEFAULT 0".to_string(),
+        "`damage_taken` INTEGER DEFAULT 0".to_string(),
+        "`last_seen` INTEGER DEFAULT 0".to_string(),
+        "`personaname` VARCHAR(128) DEFAULT ''".to_string(),
+        "`favorite_class` TINYINT DEFAULT 0".to_string(),
+        "`cached_personaname` VARCHAR(255) DEFAULT NULL".to_string(),
+        "`cached_personaname_lower` VARCHAR(255) DEFAULT NULL".to_string(),
+    ];
+    whaletracker_columns.extend(per_class_columns());
+    whaletracker_columns.extend(weapon_category_columns());
+    whaletracker_columns.push(
+        "`sort_weight` DOUBLE AS (CASE WHEN playtime >= 14400 THEN (kills + (0.5 * assists)) / GREATEST(deaths, 1) ELSE -1 END) STORED"
+            .to_string(),
+    );
+
+    let mut online_columns = vec![
+        "`steamid` VARCHAR(32) NOT NULL".to_string(),
+        "`personaname` VARCHAR(128) DEFAULT ''".to_string(),
+        "`class` TINYINT DEFAULT 0".to_string(),
+        "`team` TINYINT DEFAULT 0".to_string(),
+        "`alive` TINYINT DEFAULT 0".to_string(),
+        "`is_spectator` TINYINT DEFAULT 0".to_string(),
+        "`kills` INTEGER DEFAULT 0".to_string(),
+        "`deaths` INTEGER DEFAULT 0".to_string(),
+        "`assists` INTEGER DEFAULT 0".to_string(),
+        "`damage` INTEGER DEFAULT 0".to_string(),
+        "`damage_taken` INTEGER DEFAULT 0".to_string(),
+        "`healing` INTEGER DEFAULT 0".to_string(),
+        "`headshots` INTEGER DEFAULT 0".to_string(),
+        "`backstabs` INTEGER DEFAULT 0".to_string(),
+        "`medic_drops` INTEGER DEFAULT 0".to_string(),
+        "`uber_drops` INTEGER DEFAULT 0".to_string(),
+        "`airshots` INTEGER DEFAULT 0".to_string(),
+        "`marketGardenHits` INTEGER DEFAULT 0".to_string(),
+        "`playtime` INTEGER DEFAULT 0".to_string(),
+        "`total_ubers` INTEGER DEFAULT 0".to_string(),
+        "`best_streak` INTEGER DEFAULT 0".to_string(),
+        "`best_ubers_life` INTEGER DEFAULT 0".to_string(),
+        "`current_killstreak` INTEGER DEFAULT 0".to_string(),
+        "`current_ubers_life` INTEGER DEFAULT 0".to_string(),
+        "`visible_max` INTEGER DEFAULT 0".to_string(),
+        "`time_connected` INTEGER DEFAULT 0".to_string(),
+        "`shots` INTEGER DEFAULT 0".to_string(),
+        "`hits` INTEGER DEFAULT 0".to_string(),
+        "`host_ip` VARCHAR(64) DEFAULT ''".to_string(),
+        "`host_port` INTEGER DEFAULT 0".to_string(),
+        "`playercount` INTEGER DEFAULT 0".to_string(),
+        "`map_name` VARCHAR(128) DEFAULT ''".to_string(),
+        "`last_update` INTEGER DEFAULT 0".to_string(),
+    ];
+    online_columns.extend(per_class_columns());
+    online_columns.extend(weapon_category_columns());
+    online_columns.extend(online_weapon_slot_columns(6));
+
+    let online_meta_columns = vec![
+        "`id` TINYINT NOT NULL".to_string(),
+        "`map_name` VARCHAR(128) DEFAULT ''".to_string(),
+        "`playercount` INTEGER DEFAULT 0".to_string(),
+        "`updated_at` INTEGER DEFAULT 0".to_string(),
+        "`host_ip` VARCHAR(64) DEFAULT ''".to_string(),
+        "`host_port` INTEGER DEFAULT 0".to_string(),
+        "`visible_max` INTEGER DEFAULT 0".to_string(),
+    ];
+
+    let servers_columns = vec![
+        "`ip` VARCHAR(64) NOT NULL".to_string(),
+        "`port` INTEGER NOT NULL".to_string(),
+        "`playercount` INTEGER DEFAULT 0".to_string(),
+        "`visible_max` INTEGER DEFAULT 0".to_string(),
+        "`game` VARCHAR(64) DEFAULT ''".to_string(),
+        "`game_url` VARCHAR(32) DEFAULT ''".to_string(),
+        "`map` VARCHAR(128) DEFAULT ''".to_string(),
+        "`city` VARCHAR(128) DEFAULT ''".to_string(),
+        "`country` VARCHAR(8) DEFAULT ''".to_string(),
+        "`flags` VARCHAR(256) DEFAULT ''".to_string(),
+        "`last_update` INTEGER DEFAULT 0".to_string(),
+    ];
+
+    let logs_columns = vec![
+        "`log_id` VARCHAR(64) NOT NULL".to_string(),
+        "`map` VARCHAR(64) DEFAULT ''".to_string(),
+        "`gamemode` VARCHAR(64) DEFAULT 'Unknown'".to_string(),
+        "`started_at` INTEGER DEFAULT 0".to_string(),
+        "`ended_at` INTEGER DEFAULT 0".to_string(),
+        "`duration` INTEGER DEFAULT 0".to_string(),
+        "`player_count` INTEGER DEFAULT 0".to_string(),
+        "`created_at` INTEGER DEFAULT 0".to_string(),
+        "`updated_at` INTEGER DEFAULT 0".to_string(),
+    ];
+
+    let mut log_players_columns = vec![
+        "`log_id` VARCHAR(64) NOT NULL".to_string(),
+        "`steamid` VARCHAR(32) NOT NULL".to_string(),
+        "`personaname` VARCHAR(128) DEFAULT ''".to_string(),
+        "`kills` INTEGER DEFAULT 0".to_string(),
+        "`deaths` INTEGER DEFAULT 0".to_string(),
+        "`assists` INTEGER DEFAULT 0".to_string(),
+        "`damage` INTEGER DEFAULT 0".to_string(),
+        "`damage_taken` INTEGER DEFAULT 0".to_string(),
+        "`healing` INTEGER DEFAULT 0".to_string(),
+        "`headshots` INTEGER DEFAULT 0".to_string(),
+        "`backstabs` INTEGER DEFAULT 0".to_string(),
+        "`total_ubers` INTEGER DEFAULT 0".to_string(),
+        "`playtime` INTEGER DEFAULT 0".to_string(),
+        "`medic_drops` INTEGER DEFAULT 0".to_string(),
+        "`uber_drops` INTEGER DEFAULT 0".to_string(),
+        "`airshots` INTEGER DEFAULT 0".to_string(),
+        "`marketGardenHits` INTEGER DEFAULT 0".to_string(),
+        "`shots` INTEGER DEFAULT 0".to_string(),
+        "`hits` INTEGER DEFAULT 0".to_string(),
+        "`best_streak` INTEGER DEFAULT 0".to_string(),
+        "`best_headshots_life` INTEGER DEFAULT 0".to_string(),
+        "`best_backstabs_life` INTEGER DEFAULT 0".to_string(),
+        "`best_score_life` INTEGER DEFAULT 0".to_string(),
+        "`best_kills_life` INTEGER DEFAULT 0".to_string(),
+        "`best_assists_life` INTEGER DEFAULT 0".to_string(),
+        "`best_ubers_life` INTEGER DEFAULT 0".to_string(),
+        "`is_admin` TINYINT DEFAULT 0".to_string(),
+        "`last_updated` INTEGER DEFAULT 0".to_string(),
+    ];
+    log_players_columns.extend(per_class_columns());
+    log_players_columns.extend(weapon_category_columns());
+    log_players_columns.extend(weapon_slot_columns(6));
+    for slug in ["soldier", "demoman", "sniper", "medic"] {
+        log_players_columns.push(format!("`airshots_{}` INTEGER DEFAULT 0", slug));
+        log_players_columns.push(format!(
+            "`airshots_{}_height` INTEGER DEFAULT 0",
+            slug
+        ));
+    }
+
+    let points_cache_columns = vec![
+        "`steamid` VARCHAR(32) NOT NULL".to_string(),
+        "`points` INTEGER DEFAULT 0".to_string(),
+        "`rank` INTEGER DEFAULT 0".to_string(),
+        "`name` VARCHAR(128) DEFAULT ''".to_string(),
+        "`name_color` VARCHAR(32) DEFAULT ''".to_string(),
+        "`prename` VARCHAR(64) DEFAULT ''".to_string(),
+        "`updated_at` INTEGER DEFAULT 0".to_string(),
+    ];
+
+    let create_tables = vec![
+        build_create_table_sql(
+            "whaletracker",
+            whaletracker_columns.clone(),
+            vec![
+                "PRIMARY KEY (`steamid`)".to_string(),
+                "KEY `idx_cached_personaname_lower` (`cached_personaname_lower`)".to_string(),
+                "KEY `idx_last_seen` (`last_seen`)".to_string(),
+                "KEY `idx_sort_weight` (`sort_weight` DESC, `kills` DESC)".to_string(),
+            ],
+        ),
+        build_create_table_sql(
+            "whaletracker_online",
+            online_columns.clone(),
+            vec!["PRIMARY KEY (`steamid`)".to_string()],
+        ),
+        build_create_table_sql(
+            "whaletracker_online_meta",
+            online_meta_columns.clone(),
+            vec!["PRIMARY KEY (`id`)".to_string()],
+        ),
+        build_create_table_sql(
+            "whaletracker_servers",
+            servers_columns.clone(),
+            vec!["PRIMARY KEY (`ip`, `port`)".to_string()],
+        ),
+        build_create_table_sql(
+            "whaletracker_logs",
+            logs_columns.clone(),
+            vec!["PRIMARY KEY (`log_id`)".to_string()],
+        ),
+        build_create_table_sql(
+            "whaletracker_log_players",
+            log_players_columns.clone(),
+            vec!["PRIMARY KEY (`log_id`, `steamid`)".to_string()],
+        ),
+        build_create_table_sql(
+            "whaletracker_points_cache",
+            points_cache_columns.clone(),
+            vec!["PRIMARY KEY (`steamid`)".to_string()],
+        ),
+        "CREATE TABLE IF NOT EXISTS whaletracker_points_cache_build LIKE whaletracker_points_cache"
+            .to_string(),
+        "CREATE TABLE IF NOT EXISTS whaletracker_points_cache_state (\
+         cache_key VARCHAR(64) PRIMARY KEY,\
+         dirty TINYINT DEFAULT 0,\
+         dirty_updated_at BIGINT DEFAULT 0,\
+         last_reason VARCHAR(64) DEFAULT '',\
+         last_rebuilt_at BIGINT DEFAULT 0\
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            .to_string(),
+    ];
+
+    let mut upgrade_columns = Vec::new();
+    push_add_columns(&mut upgrade_columns, "whaletracker", &whaletracker_columns);
+    push_add_columns(&mut upgrade_columns, "whaletracker_online", &online_columns);
+    push_add_columns(
+        &mut upgrade_columns,
+        "whaletracker_online_meta",
+        &online_meta_columns,
+    );
+    push_add_columns(&mut upgrade_columns, "whaletracker_servers", &servers_columns);
+    push_add_columns(&mut upgrade_columns, "whaletracker_logs", &logs_columns);
+    push_add_columns(
+        &mut upgrade_columns,
+        "whaletracker_log_players",
+        &log_players_columns,
+    );
+    push_add_columns(
+        &mut upgrade_columns,
+        "whaletracker_points_cache",
+        &points_cache_columns,
+    );
+    push_add_columns(
+        &mut upgrade_columns,
+        "whaletracker_points_cache_build",
+        &points_cache_columns,
+    );
+    upgrade_columns.extend([
+        "CREATE INDEX IF NOT EXISTS idx_cached_personaname_lower ON whaletracker (cached_personaname_lower)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_last_seen ON whaletracker (last_seen)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_sort_weight ON whaletracker (sort_weight DESC, kills DESC)".to_string(),
+        "ALTER TABLE whaletracker CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "ALTER TABLE whaletracker_online CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "ALTER TABLE whaletracker_online_meta CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "ALTER TABLE whaletracker_servers CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "ALTER TABLE whaletracker_logs CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "ALTER TABLE whaletracker_log_players CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "ALTER TABLE whaletracker_points_cache CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "ALTER TABLE whaletracker_points_cache_build CONVERT TO CHARACTER SET utf8mb4".to_string(),
+        "DROP TABLE IF EXISTS whaletracker_mapstats".to_string(),
+    ]);
+
+    vec![
+        Migration {
+            version: 1,
+            name: "create_whaletracker_schema",
+            statements: create_tables,
+        },
+        Migration {
+            version: 2,
+            name: "upgrade_whaletracker_schema",
+            statements: upgrade_columns,
+        },
+    ]
+}
+
 #[derive(Debug, Clone)]
 struct PointsCacheConfig {
     owner_port: u16,
@@ -193,47 +683,6 @@ impl PointsCacheManager {
 
     fn is_owner(&self) -> bool {
         self.bind_port > 0 && self.bind_port == self.cfg.owner_port
-    }
-
-    fn ensure_schema(&self) -> Result<(), String> {
-        let mut conn = self.pool.get_conn().map_err(|e| e.to_string())?;
-        conn.query_drop(
-            "CREATE TABLE IF NOT EXISTS whaletracker_points_cache (\
-             steamid VARCHAR(32) PRIMARY KEY,\
-             points INTEGER DEFAULT 0,\
-             rank INTEGER DEFAULT 0,\
-             name VARCHAR(128) DEFAULT '',\
-             name_color VARCHAR(32) DEFAULT '',\
-             prename VARCHAR(64) DEFAULT '',\
-             updated_at INTEGER DEFAULT 0\
-             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-        )
-        .map_err(|e| e.to_string())?;
-        conn.query_drop(
-            "CREATE TABLE IF NOT EXISTS whaletracker_points_cache_build LIKE whaletracker_points_cache",
-        )
-        .map_err(|e| e.to_string())?;
-        for query in [
-            "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS name_color VARCHAR(32) DEFAULT ''",
-            "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS name VARCHAR(128) DEFAULT ''",
-            "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS prename VARCHAR(64) DEFAULT ''",
-            "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS rank INTEGER DEFAULT 0",
-            "ALTER TABLE whaletracker_points_cache_build ADD COLUMN IF NOT EXISTS name_color VARCHAR(32) DEFAULT ''",
-            "ALTER TABLE whaletracker_points_cache_build ADD COLUMN IF NOT EXISTS name VARCHAR(128) DEFAULT ''",
-            "ALTER TABLE whaletracker_points_cache_build ADD COLUMN IF NOT EXISTS prename VARCHAR(64) DEFAULT ''",
-            "ALTER TABLE whaletracker_points_cache_build ADD COLUMN IF NOT EXISTS rank INTEGER DEFAULT 0",
-            "ALTER TABLE whaletracker_points_cache_build CONVERT TO CHARACTER SET utf8mb4",
-            "CREATE TABLE IF NOT EXISTS whaletracker_points_cache_state (\
-             cache_key VARCHAR(64) PRIMARY KEY,\
-             dirty TINYINT DEFAULT 0,\
-             dirty_updated_at BIGINT DEFAULT 0,\
-             last_reason VARCHAR(64) DEFAULT '',\
-             last_rebuilt_at BIGINT DEFAULT 0\
-             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-        ] {
-            conn.query_drop(query).map_err(|e| e.to_string())?;
-        }
-        Ok(())
     }
 
     fn mark_dirty(&self, reason: &str, force: bool) -> Result<(), String> {
@@ -755,13 +1204,21 @@ fn main() -> std::io::Result<()> {
     }
 
     let points_cache_cfg = PointsCacheConfig::from_env();
+    let schema = SchemaManager::new(
+        &db_cfg,
+        bind_port,
+        points_cache_cfg.owner_port,
+        DEFAULT_SCHEMA_POLL_MS,
+    )
+    .map_err(|e| std::io::Error::other(format!("schema init failed: {e}")))?;
+    schema
+        .prepare()
+        .map_err(|e| std::io::Error::other(format!("schema prepare failed: {e}")))?;
+
     let points_cache = Arc::new(
         PointsCacheManager::new(&db_cfg, bind_port, points_cache_cfg.clone())
             .map_err(|e| std::io::Error::other(format!("points cache init failed: {e}")))?,
     );
-    points_cache
-        .ensure_schema()
-        .map_err(|e| std::io::Error::other(format!("points cache schema init failed: {e}")))?;
 
     let sink = Arc::new(
         SqlSink::new(
