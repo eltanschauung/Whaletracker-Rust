@@ -448,12 +448,15 @@ int GetWhalePointsForClient(int client)
     }
 
     float positive = 0.0;
-    positive += float(safeDamage) / 200.0;
+    positive += float(safeDamage) / 300.0;
     positive += float(safeHealing) / 400.0;
-    positive += float(safeKills);
-    positive += float(RoundToFloor(float(safeAssists) * 0.5));
+    positive += float(RoundToFloor(float(safeKills) * 1.5 + float(safeAssists) * 0.5));
     positive += float(safeBackstabs);
     positive += float(safeHeadshots);
+    positive += float(safeMarketGardenHits * 5);
+    positive += float(safeMedicKills);
+    positive += float(safeHeavyKills);
+    positive += float(safeAirshots * 3);
     positive += float(safeTotalUbers * 10);
     if (positive < 0.0)
     {
@@ -464,7 +467,7 @@ int GetWhalePointsForClient(int client)
         positive = 2147483000.0;
     }
 
-    int denominatorBase = safeDeaths;
+    int denominatorBase = RoundToFloor(safeDeaths + safeDamageTaken / 500.0);
     if (denominatorBase < 1)
     {
         denominatorBase = 1;
