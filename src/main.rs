@@ -21,7 +21,7 @@ const DEFAULT_POINTS_CACHE_DEBOUNCE_MS: u64 = 3000;
 const DEFAULT_POINTS_CACHE_POLL_MS: u64 = 1000;
 const DEFAULT_POINTS_CACHE_TOUCH_MS: u64 = 1000;
 const DEFAULT_SCHEMA_POLL_MS: u64 = 1000;
-const WHALETRACKER_SCHEMA_VERSION: u32 = 3;
+const WHALETRACKER_SCHEMA_VERSION: u32 = 2;
 const POINTS_CACHE_STATE_KEY: &str = "global";
 const SCHEMA_VERSION_TABLE: &str = "whaletracker_schema_migrations";
 const WHALE_RANK_MIN_KD_SUM: i32 = 200;
@@ -521,29 +521,6 @@ fn schema_migrations() -> Vec<Migration> {
         "`updated_at` INTEGER DEFAULT 0".to_string(),
     ];
 
-    let chat_columns = vec![
-        "`id` INTEGER NOT NULL AUTO_INCREMENT".to_string(),
-        "`created_at` INTEGER NOT NULL".to_string(),
-        "`steamid` VARCHAR(32) DEFAULT NULL".to_string(),
-        "`personaname` VARCHAR(128) DEFAULT NULL".to_string(),
-        "`iphash` VARCHAR(64) DEFAULT NULL".to_string(),
-        "`message` TEXT NOT NULL".to_string(),
-        "`server_ip` VARCHAR(64) DEFAULT NULL".to_string(),
-        "`server_port` INTEGER DEFAULT NULL".to_string(),
-        "`alert` TINYINT DEFAULT 1".to_string(),
-    ];
-
-    let chat_outbox_columns = vec![
-        "`id` INTEGER NOT NULL AUTO_INCREMENT".to_string(),
-        "`created_at` INTEGER NOT NULL".to_string(),
-        "`iphash` VARCHAR(64) NOT NULL".to_string(),
-        "`display_name` VARCHAR(128) DEFAULT ''".to_string(),
-        "`message` TEXT NOT NULL".to_string(),
-        "`server_ip` VARCHAR(64) DEFAULT NULL".to_string(),
-        "`server_port` INTEGER DEFAULT NULL".to_string(),
-        "`delivered_to` TEXT DEFAULT NULL".to_string(),
-    ];
-
     let create_tables = vec![
         build_create_table_sql(
             "whaletracker",
@@ -595,22 +572,6 @@ fn schema_migrations() -> Vec<Migration> {
          last_rebuilt_at BIGINT DEFAULT 0\
          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
             .to_string(),
-        build_create_table_sql(
-            "whaletracker_chat",
-            chat_columns.clone(),
-            vec![
-                "PRIMARY KEY (`id`)".to_string(),
-                "KEY `idx_created_at` (`created_at`)".to_string(),
-            ],
-        ),
-        build_create_table_sql(
-            "whaletracker_chat_outbox",
-            chat_outbox_columns.clone(),
-            vec![
-                "PRIMARY KEY (`id`)".to_string(),
-                "KEY `idx_created_at` (`created_at`)".to_string(),
-            ],
-        ),
     ];
 
     let mut upgrade_columns = Vec::new();
@@ -663,31 +624,6 @@ fn schema_migrations() -> Vec<Migration> {
             version: 2,
             name: "upgrade_whaletracker_schema",
             statements: upgrade_columns,
-        },
-        Migration {
-            version: 3,
-            name: "add_whaletracker_chat_tables",
-            statements: vec![
-                build_create_table_sql(
-                    "whaletracker_chat",
-                    chat_columns,
-                    vec![
-                        "PRIMARY KEY (`id`)".to_string(),
-                        "KEY `idx_created_at` (`created_at`)".to_string(),
-                    ],
-                ),
-                build_create_table_sql(
-                    "whaletracker_chat_outbox",
-                    chat_outbox_columns,
-                    vec![
-                        "PRIMARY KEY (`id`)".to_string(),
-                        "KEY `idx_created_at` (`created_at`)".to_string(),
-                    ],
-                ),
-                "ALTER TABLE whaletracker_chat ADD COLUMN IF NOT EXISTS alert TINYINT DEFAULT 1".to_string(),
-                "ALTER TABLE whaletracker_chat CONVERT TO CHARACTER SET utf8mb4".to_string(),
-                "ALTER TABLE whaletracker_chat_outbox CONVERT TO CHARACTER SET utf8mb4".to_string(),
-            ],
         },
     ]
 }
