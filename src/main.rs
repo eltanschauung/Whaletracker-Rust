@@ -837,7 +837,7 @@ impl PointsCacheManager {
              SELECT base.steamid, base.points, COALESCE(ranked.rank, 0), base.name, base.color, base.prename, {now} \
              FROM (\
              SELECT w.steamid, {expr} AS points, \
-             COALESCE(NULLIF(w.cached_personaname,''), NULLIF(w.personaname,''), COALESCE(NULLIF(c.name,''), w.steamid)) AS name, \
+             COALESCE(NULLIF(w.cached_personaname,''), COALESCE(NULLIF(c.name,''), w.steamid)) AS name, \
              COALESCE(NULLIF(f.color COLLATE utf8mb4_uca1400_ai_ci,''), COALESCE(NULLIF(c.name_color,''), 'gold')) AS color, \
              COALESCE((SELECT p.newname COLLATE utf8mb4_uca1400_ai_ci FROM prename_rules p WHERE p.pattern COLLATE utf8mb4_uca1400_ai_ci = w.steamid LIMIT 1), COALESCE(NULLIF(c.prename,''), '')) AS prename \
              FROM whaletracker w \
