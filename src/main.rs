@@ -21,7 +21,8 @@ const DEFAULT_POINTS_CACHE_DEBOUNCE_MS: u64 = 3000;
 const DEFAULT_POINTS_CACHE_POLL_MS: u64 = 1000;
 const DEFAULT_POINTS_CACHE_TOUCH_MS: u64 = 1000;
 const DEFAULT_SCHEMA_POLL_MS: u64 = 1000;
-const WHALETRACKER_SCHEMA_VERSION: u32 = 2;
+const WHALETRACKER_SCHEMA_VERSION: u32 = 3;
+const MAX_LOG_DAMAGE_PER_MINUTE: f64 = 3000.0;
 const POINTS_CACHE_STATE_KEY: &str = "global";
 const SCHEMA_VERSION_TABLE: &str = "whaletracker_schema_migrations";
 const WHALE_RANK_MIN_KD_SUM: i32 = 200;
@@ -366,8 +367,7 @@ fn schema_migrations() -> Vec<Migration> {
         "`uber_drops` INTEGER DEFAULT 0".to_string(),
         "`airshots` INTEGER DEFAULT 0".to_string(),
         "`bonusPoints` INTEGER DEFAULT 0".to_string(),
-        "`medicKills` INTEGER DEFAULT 0".to_string(),
-        "`heavyKills` INTEGER DEFAULT 0".to_string(),
+        "`totalCrossbowHits` INTEGER DEFAULT 0".to_string(),
         "`marketGardenHits` INTEGER DEFAULT 0".to_string(),
         "`headshots` INTEGER DEFAULT 0".to_string(),
         "`backstabs` INTEGER DEFAULT 0".to_string(),
@@ -614,6 +614,13 @@ fn schema_migrations() -> Vec<Migration> {
         "DROP TABLE IF EXISTS whaletracker_mapstats".to_string(),
     ]);
 
+    let remove_dead_columns = vec![
+        "ALTER TABLE whaletracker ADD COLUMN IF NOT EXISTS totalCrossbowHits INTEGER DEFAULT 0"
+            .to_string(),
+        "ALTER TABLE whaletracker DROP COLUMN IF EXISTS medicKills".to_string(),
+        "ALTER TABLE whaletracker DROP COLUMN IF EXISTS heavyKills".to_string(),
+    ];
+
     vec![
         Migration {
             version: 1,
@@ -624,6 +631,11 @@ fn schema_migrations() -> Vec<Migration> {
             version: 2,
             name: "upgrade_whaletracker_schema",
             statements: upgrade_columns,
+        },
+        Migration {
+            version: 3,
+            name: "remove_dead_whaletracker_columns",
+            statements: remove_dead_columns,
         },
     ]
 }
@@ -1065,12 +1077,26 @@ impl SqlSink {
         let mut touched_logs = false;
 
         for write in writes {
-            if write.sql.trim().is_empty() {
+            let sql = write.sql.trim();
+            if sql.is_empty() {
                 self.stats.dropped_writes.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
-            let lane_kind = Self::lane_for_sql(&write.sql);
+            if let Err(reason) = validate_sql_write(sql) {
+                self.stats.dropped_writes.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[sql-sink] drop invalid write kind={} user_id={:?} batch_id={:?}: {} | sql={}",
+                    classify_sql(sql),
+                    write.user_id,
+                    batch_id,
+                    reason,
+                    preview_sql(sql, 256)
+                );
+                continue;
+            }
+
+            let lane_kind = Self::lane_for_sql(sql);
             let lane = self.lane_by_kind(lane_kind);
             let mut q = lane.queue.lock().expect("lane queue mutex poisoned");
             q.push_back(QueuedSqlWrite {
@@ -1435,6 +1461,178 @@ fn preview_sql(sql: &str, max_len: usize) -> String {
     out
 }
 
+fn validate_sql_write(sql: &str) -> Result<(), String> {
+    if classify_sql(sql) == "whaletracker_log_players" {
+        validate_log_player_write(sql)?;
+    }
+    Ok(())
+}
+
+fn validate_log_player_write(sql: &str) -> Result<(), String> {
+    let Some((columns, values)) = parse_insert_columns_values(sql, "whaletracker_log_players") else {
+        return Ok(());
+    };
+
+    let damage = sql_int_column(&columns, &values, "damage")
+        .ok_or_else(|| "missing log-player damage column".to_string())?;
+    let damage_taken = sql_int_column(&columns, &values, "damage_taken")
+        .ok_or_else(|| "missing log-player damage_taken column".to_string())?;
+    let playtime = sql_int_column(&columns, &values, "playtime")
+        .ok_or_else(|| "missing log-player playtime column".to_string())?;
+
+    if !is_log_rate_plausible(damage, playtime) {
+        return Err(format!(
+            "implausible log-player damage rate: damage={} playtime={} max_dpm={}",
+            damage, playtime, MAX_LOG_DAMAGE_PER_MINUTE
+        ));
+    }
+    if !is_log_rate_plausible(damage_taken, playtime) {
+        return Err(format!(
+            "implausible log-player damage-taken rate: damage_taken={} playtime={} max_dpm={}",
+            damage_taken, playtime, MAX_LOG_DAMAGE_PER_MINUTE
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_log_rate_plausible(amount: i64, playtime: i64) -> bool {
+    if amount < 0 || playtime < 0 {
+        return false;
+    }
+    if amount == 0 {
+        return true;
+    }
+    if playtime <= 0 {
+        return false;
+    }
+    (amount as f64 * 60.0 / playtime as f64) <= MAX_LOG_DAMAGE_PER_MINUTE
+}
+
+fn parse_insert_columns_values(sql: &str, table: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let trimmed = sql.trim_start();
+    let prefix = format!("insert into {}", table);
+    if !trimmed.to_ascii_lowercase().starts_with(&prefix) {
+        return None;
+    }
+
+    let columns_open = trimmed.find('(')?;
+    let columns_close = find_matching_paren(trimmed, columns_open)?;
+    let after_columns = columns_close + 1;
+    let values_rel = find_ascii_case_insensitive(&trimmed[after_columns..], "values")?;
+    let values_pos = after_columns + values_rel;
+    let values_open = trimmed[values_pos..].find('(')? + values_pos;
+    let values_close = find_matching_paren(trimmed, values_open)?;
+
+    let columns = split_sql_list(&trimmed[columns_open + 1..columns_close])
+        .into_iter()
+        .map(|column| normalize_sql_column(&column))
+        .collect::<Vec<_>>();
+    let values = split_sql_list(&trimmed[values_open + 1..values_close]);
+
+    if columns.len() != values.len() {
+        return None;
+    }
+    Some((columns, values))
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+}
+
+fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut depth = 0i32;
+
+    for (idx, ch) in sql.char_indices().skip_while(|(idx, _)| *idx < open) {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '\'' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        if ch == '\'' {
+            in_quote = true;
+            continue;
+        }
+        if ch == '(' {
+            depth += 1;
+            continue;
+        }
+        if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn split_sql_list(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut depth = 0i32;
+
+    for (idx, ch) in input.char_indices() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '\'' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => in_quote = true,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(input[start..idx].trim().to_string());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(input[start..].trim().to_string());
+    parts
+}
+
+fn normalize_sql_column(column: &str) -> String {
+    column
+        .trim()
+        .trim_matches('`')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn sql_int_column(columns: &[String], values: &[String], column: &str) -> Option<i64> {
+    let column = column.to_ascii_lowercase();
+    let index = columns.iter().position(|candidate| candidate == &column)?;
+    parse_sql_i64(values.get(index)?)
+}
+
+fn parse_sql_i64(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("null") {
+        return Some(0);
+    }
+    value.trim_matches('\'').parse::<i64>().ok()
+}
+
 fn classify_sql(sql: &str) -> &'static str {
     let lower = sql.to_ascii_lowercase();
     if lower.contains("whaletracker_online") {
@@ -1456,4 +1654,23 @@ fn classify_sql(sql: &str) -> &'static str {
         return "whaletracker_main";
     }
     "other"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_plausible_log_player_insert() {
+        let sql = "INSERT INTO whaletracker_log_players (log_id, steamid, personaname, damage, damage_taken, playtime) VALUES ('log', 'steam', 'name', 2400, 1200, 120)";
+
+        assert!(validate_sql_write(sql).is_ok());
+    }
+
+    #[test]
+    fn rejects_implausible_log_player_dpm() {
+        let sql = "INSERT INTO whaletracker_log_players (log_id, steamid, personaname, damage, damage_taken, playtime) VALUES ('log', 'steam', 'name', 4738, 0, 22)";
+
+        assert!(validate_sql_write(sql).is_err());
+    }
 }
