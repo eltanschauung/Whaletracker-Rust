@@ -1,6 +1,6 @@
 use mysql::{params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +15,7 @@ const DEFAULT_MAX_FRAME_BYTES: usize = 32768;
 const DEFAULT_MAX_INBOUND_WRITES: usize = 256;
 const DEFAULT_MAX_SQL_BYTES: usize = 8192;
 const DEFAULT_MAX_QUEUE_ROWS: usize = 8192;
+const DEFAULT_DEDUPE_EVENTS: usize = 65536;
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
@@ -66,6 +67,7 @@ impl DbExecutor for MysqlDbExecutor {
 struct QueuedSqlWrite {
     sql: String,
     user_id: Option<u32>,
+    event_id: Option<String>,
     source_batch_id: Option<i64>,
     enqueued_at_ms: u128,
     completion: Option<Arc<BatchCompletion>>,
@@ -140,11 +142,70 @@ struct EnqueueError {
     limit: usize,
 }
 
+struct DedupeCache {
+    state: Mutex<DedupeState>,
+    max_entries: usize,
+}
+
+struct DedupeState {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl DedupeCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            state: Mutex::new(DedupeState {
+                seen: HashSet::new(),
+                order: VecDeque::new(),
+            }),
+            max_entries,
+        }
+    }
+
+    fn contains(&self, event_id: &str) -> bool {
+        if event_id.is_empty() {
+            return false;
+        }
+        self.state
+            .lock()
+            .expect("dedupe mutex poisoned")
+            .seen
+            .contains(event_id)
+    }
+
+    fn remember(&self, event_id: &str) {
+        if event_id.is_empty() || self.max_entries == 0 {
+            return;
+        }
+
+        let mut state = self.state.lock().expect("dedupe mutex poisoned");
+        if !state.seen.insert(event_id.to_string()) {
+            return;
+        }
+        state.order.push_back(event_id.to_string());
+        while state.order.len() > self.max_entries {
+            if let Some(oldest) = state.order.pop_front() {
+                state.seen.remove(&oldest);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("dedupe mutex poisoned")
+            .seen
+            .len()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SinkConfig {
     flush_interval: Duration,
     max_batch_rows: usize,
     max_queue_rows: usize,
+    max_dedupe_events: usize,
 }
 
 #[derive(Clone)]
@@ -989,6 +1050,7 @@ struct LaneWorker {
     db: Mutex<Box<dyn DbExecutor>>,
     stats: LaneStats,
     points_cache: Option<Arc<PointsCacheManager>>,
+    dedupe: Arc<DedupeCache>,
 }
 
 impl LaneWorker {
@@ -997,6 +1059,7 @@ impl LaneWorker {
         db: Box<dyn DbExecutor>,
         cfg: SinkConfig,
         points_cache: Option<Arc<PointsCacheManager>>,
+        dedupe: Arc<DedupeCache>,
     ) -> Self {
         Self {
             lane,
@@ -1006,6 +1069,7 @@ impl LaneWorker {
             db: Mutex::new(db),
             stats: LaneStats::default(),
             points_cache,
+            dedupe,
         }
     }
 
@@ -1076,6 +1140,9 @@ impl LaneWorker {
                             kind,
                             item.source_batch_id
                         );
+                        if let Some(event_id) = &item.event_id {
+                            self.dedupe.remember(event_id);
+                        }
                         true
                     }
                     Err(err) => {
@@ -1104,6 +1171,7 @@ impl LaneWorker {
 struct SqlSink {
     lanes: Vec<Arc<LaneWorker>>,
     stats: Arc<SinkStats>,
+    dedupe: Arc<DedupeCache>,
 }
 
 impl SqlSink {
@@ -1113,6 +1181,7 @@ impl SqlSink {
         points_cache: Option<Arc<PointsCacheManager>>,
     ) -> Result<Self, String> {
         let mut lanes = Vec::with_capacity(SqlLane::ALL.len());
+        let dedupe = Arc::new(DedupeCache::new(cfg.max_dedupe_events));
         for lane in SqlLane::ALL {
             let db = MysqlDbExecutor::connect(db_cfg)?;
             let lane_points_cache = if lane == SqlLane::Stats {
@@ -1125,11 +1194,13 @@ impl SqlSink {
                 Box::new(db),
                 cfg.clone(),
                 lane_points_cache,
+                Arc::clone(&dedupe),
             )));
         }
         Ok(Self {
             lanes,
             stats: Arc::new(SinkStats::default()),
+            dedupe,
         })
     }
 
@@ -1188,6 +1259,17 @@ impl SqlSink {
                 continue;
             }
 
+            if let Some(event_id) = write.event_id.as_deref() {
+                if self.dedupe.contains(event_id) {
+                    self.stats.dropped_writes.fetch_add(1, Ordering::Relaxed);
+                    println!(
+                        "[sql-sink] drop duplicate event_id={} user_id={:?} batch_id={:?}",
+                        event_id, write.user_id, batch_id
+                    );
+                    continue;
+                }
+            }
+
             let lane_kind = Self::lane_for_sql(sql);
             accepted_writes.push((write, lane_kind));
         }
@@ -1215,6 +1297,7 @@ impl SqlSink {
             q.push_back(QueuedSqlWrite {
                 sql: write.sql,
                 user_id: write.user_id,
+                event_id: write.event_id,
                 source_batch_id: batch_id,
                 enqueued_at_ms: now_ms,
                 completion: completion.clone(),
@@ -1278,6 +1361,8 @@ struct SqlWrite {
     #[serde(default)]
     user_id: Option<u32>,
     #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
     force_sync: Option<bool>,
 }
 
@@ -1311,6 +1396,7 @@ struct HelloResponse<'a> {
 struct HealthResponse<'a> {
     r#type: &'a str,
     queue_depth: usize,
+    dedupe_events: usize,
     accepted_writes: u64,
     executed_writes: u64,
     db_errors: u64,
@@ -1339,6 +1425,11 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_QUEUE_ROWS)
         .clamp(1, 1_000_000);
+    let max_dedupe_events = std::env::var("WT_RUST_DEDUPE_EVENTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DEDUPE_EVENTS)
+        .min(1_000_000);
     let max_frame_bytes = std::env::var("WT_RUST_MAX_FRAME_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1400,14 +1491,16 @@ fn main() -> std::io::Result<()> {
                 flush_interval: Duration::from_millis(flush_interval_ms.max(1)),
                 max_batch_rows: max_batch_rows.max(1),
                 max_queue_rows,
+                max_dedupe_events,
             },
             Some(Arc::clone(&points_cache)),
         )
         .map_err(|e| std::io::Error::other(format!("db init failed: {e}")))?,
     );
     println!(
-        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_queue_rows={}, max_frame_bytes={}, max_inbound_writes={}, max_sql_bytes={}, auth_required={})",
+        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_queue_rows={}, max_dedupe_events={}, max_frame_bytes={}, max_inbound_writes={}, max_sql_bytes={}, auth_required={})",
         max_queue_rows,
+        max_dedupe_events,
         protocol_cfg.max_frame_bytes,
         protocol_cfg.max_inbound_writes,
         protocol_cfg.max_sql_bytes,
@@ -1659,6 +1752,7 @@ fn handle_client(
                     &HealthResponse {
                         r#type: "health",
                         queue_depth: sink.queue_depth(),
+                        dedupe_events: sink.dedupe.len(),
                         accepted_writes: sink.stats.accepted_writes.load(Ordering::Relaxed),
                         executed_writes: sink.stats.executed_writes.load(Ordering::Relaxed),
                         db_errors: sink.stats.db_errors.load(Ordering::Relaxed),
@@ -2092,6 +2186,7 @@ mod tests {
         let ok_write = SqlWrite {
             sql: "SELECT 1".to_string(),
             user_id: None,
+            event_id: None,
             force_sync: None,
         };
         assert!(validate_inbound_batch_shape(&cfg, &[ok_write]).is_ok());
@@ -2100,11 +2195,13 @@ mod tests {
             SqlWrite {
                 sql: "SELECT 1".to_string(),
                 user_id: None,
+                event_id: None,
                 force_sync: None,
             },
             SqlWrite {
                 sql: "SELECT 2".to_string(),
                 user_id: None,
+                event_id: None,
                 force_sync: None,
             },
         ];
@@ -2116,11 +2213,28 @@ mod tests {
         let too_large = vec![SqlWrite {
             sql: "SELECT 123".to_string(),
             user_id: None,
+            event_id: None,
             force_sync: None,
         }];
         assert_eq!(
             validate_inbound_batch_shape(&cfg, &too_large).unwrap_err(),
             "sql too large"
         );
+    }
+
+    #[test]
+    fn dedupe_cache_remembers_successful_events_with_eviction() {
+        let cache = DedupeCache::new(2);
+        assert!(!cache.contains("event-a"));
+
+        cache.remember("event-a");
+        cache.remember("event-b");
+        assert!(cache.contains("event-a"));
+        assert!(cache.contains("event-b"));
+
+        cache.remember("event-c");
+        assert!(!cache.contains("event-a"));
+        assert!(cache.contains("event-b"));
+        assert!(cache.contains("event-c"));
     }
 }
