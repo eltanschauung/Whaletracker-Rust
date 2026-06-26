@@ -73,9 +73,10 @@ struct SinkConfig {
     max_batch_rows: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProtocolConfig {
     max_frame_bytes: usize,
+    auth_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1151,6 +1152,7 @@ enum InboundMessage {
         service: Option<String>,
         proto: Option<u32>,
         server_id: Option<String>,
+        auth: Option<String>,
         ts: Option<i64>,
     },
     SqlBatch {
@@ -1226,7 +1228,11 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
         .clamp(1024, 1024 * 1024);
-    let protocol_cfg = ProtocolConfig { max_frame_bytes };
+    let auth_token = std::env::var("WT_RUST_AUTH_TOKEN").unwrap_or_default();
+    let protocol_cfg = ProtocolConfig {
+        max_frame_bytes,
+        auth_token,
+    };
     let db_cfg = DbConfig::from_env();
 
     println!(
@@ -1271,8 +1277,9 @@ fn main() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(format!("db init failed: {e}")))?,
     );
     println!(
-        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_frame_bytes={})",
-        protocol_cfg.max_frame_bytes
+        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_frame_bytes={}, auth_required={})",
+        protocol_cfg.max_frame_bytes,
+        protocol_auth_required(&protocol_cfg) as u8
     );
     sink.spawn_workers();
     points_cache.spawn_worker();
@@ -1284,7 +1291,7 @@ fn main() -> std::io::Result<()> {
         match incoming {
             Ok(stream) => {
                 let sink = Arc::clone(&sink);
-                let protocol_cfg = protocol_cfg;
+                let protocol_cfg = protocol_cfg.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_client(stream, sink, protocol_cfg) {
                         eprintln!("[sql-sink] client handler error: {}", e);
@@ -1311,6 +1318,7 @@ fn handle_client(
     let mut writer = stream;
 
     println!("[sql-sink] client connected: {:?}", peer);
+    let mut authenticated = !protocol_auth_required(&protocol_cfg);
 
     let mut buf = Vec::with_capacity(4096);
     loop {
@@ -1361,8 +1369,23 @@ fn handle_client(
                 service,
                 proto,
                 server_id,
+                auth,
                 ts,
             }) => {
+                if !protocol_auth_matches(&protocol_cfg, auth.as_deref()) {
+                    sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[sql-sink] unauthorized hello from {:?}", peer);
+                    send_json_line(
+                        &mut writer,
+                        &ErrorResponse {
+                            r#type: "error",
+                            message: "unauthorized",
+                            ts: now_secs(),
+                        },
+                    )?;
+                    break;
+                }
+                authenticated = true;
                 println!(
                     "[sql-sink] hello from {:?}: service={:?} proto={:?} server_id={:?} ts={:?}",
                     peer, service, proto, server_id, ts
@@ -1382,6 +1405,18 @@ fn handle_client(
                 sent_at,
                 writes,
             }) => {
+                if !authenticated {
+                    sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                    send_json_line(
+                        &mut writer,
+                        &ErrorResponse {
+                            r#type: "error",
+                            message: "hello required",
+                            ts: now_secs(),
+                        },
+                    )?;
+                    continue;
+                }
                 let total = writes.len();
                 let online_writes = writes
                     .iter()
@@ -1425,6 +1460,18 @@ fn handle_client(
                 )?;
             }
             Ok(InboundMessage::Health) => {
+                if !authenticated {
+                    sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                    send_json_line(
+                        &mut writer,
+                        &ErrorResponse {
+                            r#type: "error",
+                            message: "hello required",
+                            ts: now_secs(),
+                        },
+                    )?;
+                    continue;
+                }
                 send_json_line(
                     &mut writer,
                     &HealthResponse {
@@ -1527,6 +1574,17 @@ fn trim_frame_cr(frame: &mut Vec<u8>) {
     if frame.last().copied() == Some(b'\r') {
         frame.pop();
     }
+}
+
+fn protocol_auth_required(cfg: &ProtocolConfig) -> bool {
+    !cfg.auth_token.trim().is_empty()
+}
+
+fn protocol_auth_matches(cfg: &ProtocolConfig, provided: Option<&str>) -> bool {
+    if !protocol_auth_required(cfg) {
+        return true;
+    }
+    provided == Some(cfg.auth_token.as_str())
 }
 
 fn send_json_line<T: Serialize>(writer: &mut TcpStream, value: &T) -> std::io::Result<()> {
@@ -1805,5 +1863,22 @@ mod tests {
             FrameRead::Line
         );
         assert_eq!(std::str::from_utf8(&out).unwrap(), "ok");
+    }
+
+    #[test]
+    fn optional_protocol_auth_matches_only_when_configured() {
+        let open_cfg = ProtocolConfig {
+            max_frame_bytes: 64,
+            auth_token: String::new(),
+        };
+        assert!(protocol_auth_matches(&open_cfg, None));
+
+        let locked_cfg = ProtocolConfig {
+            max_frame_bytes: 64,
+            auth_token: "secret".to_string(),
+        };
+        assert!(!protocol_auth_matches(&locked_cfg, None));
+        assert!(!protocol_auth_matches(&locked_cfg, Some("wrong")));
+        assert!(protocol_auth_matches(&locked_cfg, Some("secret")));
     }
 }
