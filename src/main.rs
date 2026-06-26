@@ -12,6 +12,8 @@ const DEFAULT_BIND: &str = "127.0.0.1:28017";
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 100;
 const DEFAULT_MAX_BATCH_ROWS: usize = 256;
 const DEFAULT_MAX_FRAME_BYTES: usize = 32768;
+const DEFAULT_MAX_INBOUND_WRITES: usize = 256;
+const DEFAULT_MAX_SQL_BYTES: usize = 8192;
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
@@ -76,6 +78,8 @@ struct SinkConfig {
 #[derive(Clone)]
 struct ProtocolConfig {
     max_frame_bytes: usize,
+    max_inbound_writes: usize,
+    max_sql_bytes: usize,
     auth_token: String,
 }
 
@@ -1228,9 +1232,21 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
         .clamp(1024, 1024 * 1024);
+    let max_inbound_writes = std::env::var("WT_RUST_MAX_INBOUND_WRITES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_INBOUND_WRITES)
+        .clamp(1, 4096);
+    let max_sql_bytes = std::env::var("WT_RUST_MAX_SQL_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_SQL_BYTES)
+        .clamp(256, 1024 * 1024);
     let auth_token = std::env::var("WT_RUST_AUTH_TOKEN").unwrap_or_default();
     let protocol_cfg = ProtocolConfig {
         max_frame_bytes,
+        max_inbound_writes,
+        max_sql_bytes,
         auth_token,
     };
     let db_cfg = DbConfig::from_env();
@@ -1277,8 +1293,10 @@ fn main() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(format!("db init failed: {e}")))?,
     );
     println!(
-        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_frame_bytes={}, auth_required={})",
+        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_frame_bytes={}, max_inbound_writes={}, max_sql_bytes={}, auth_required={})",
         protocol_cfg.max_frame_bytes,
+        protocol_cfg.max_inbound_writes,
+        protocol_cfg.max_sql_bytes,
         protocol_auth_required(&protocol_cfg) as u8
     );
     sink.spawn_workers();
@@ -1412,6 +1430,27 @@ fn handle_client(
                         &ErrorResponse {
                             r#type: "error",
                             message: "hello required",
+                            ts: now_secs(),
+                        },
+                    )?;
+                    continue;
+                }
+                if let Err(message) = validate_inbound_batch_shape(&protocol_cfg, &writes) {
+                    sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[sql-sink] rejected batch {:?} from {:?}: {} (writes={}, max_writes={}, max_sql_bytes={})",
+                        batch_id,
+                        peer,
+                        message,
+                        writes.len(),
+                        protocol_cfg.max_inbound_writes,
+                        protocol_cfg.max_sql_bytes
+                    );
+                    send_json_line(
+                        &mut writer,
+                        &ErrorResponse {
+                            r#type: "error",
+                            message,
                             ts: now_secs(),
                         },
                     )?;
@@ -1585,6 +1624,19 @@ fn protocol_auth_matches(cfg: &ProtocolConfig, provided: Option<&str>) -> bool {
         return true;
     }
     provided == Some(cfg.auth_token.as_str())
+}
+
+fn validate_inbound_batch_shape(
+    cfg: &ProtocolConfig,
+    writes: &[SqlWrite],
+) -> Result<(), &'static str> {
+    if writes.len() > cfg.max_inbound_writes {
+        return Err("too many writes");
+    }
+    if writes.iter().any(|write| write.sql.len() > cfg.max_sql_bytes) {
+        return Err("sql too large");
+    }
+    Ok(())
 }
 
 fn send_json_line<T: Serialize>(writer: &mut TcpStream, value: &T) -> std::io::Result<()> {
@@ -1869,16 +1921,63 @@ mod tests {
     fn optional_protocol_auth_matches_only_when_configured() {
         let open_cfg = ProtocolConfig {
             max_frame_bytes: 64,
+            max_inbound_writes: 2,
+            max_sql_bytes: 64,
             auth_token: String::new(),
         };
         assert!(protocol_auth_matches(&open_cfg, None));
 
         let locked_cfg = ProtocolConfig {
             max_frame_bytes: 64,
+            max_inbound_writes: 2,
+            max_sql_bytes: 64,
             auth_token: "secret".to_string(),
         };
         assert!(!protocol_auth_matches(&locked_cfg, None));
         assert!(!protocol_auth_matches(&locked_cfg, Some("wrong")));
         assert!(protocol_auth_matches(&locked_cfg, Some("secret")));
+    }
+
+    #[test]
+    fn rejects_oversized_inbound_batches_and_writes() {
+        let cfg = ProtocolConfig {
+            max_frame_bytes: 128,
+            max_inbound_writes: 1,
+            max_sql_bytes: 8,
+            auth_token: String::new(),
+        };
+        let ok_write = SqlWrite {
+            sql: "SELECT 1".to_string(),
+            user_id: None,
+            force_sync: None,
+        };
+        assert!(validate_inbound_batch_shape(&cfg, &[ok_write]).is_ok());
+
+        let too_many = vec![
+            SqlWrite {
+                sql: "SELECT 1".to_string(),
+                user_id: None,
+                force_sync: None,
+            },
+            SqlWrite {
+                sql: "SELECT 2".to_string(),
+                user_id: None,
+                force_sync: None,
+            },
+        ];
+        assert_eq!(
+            validate_inbound_batch_shape(&cfg, &too_many).unwrap_err(),
+            "too many writes"
+        );
+
+        let too_large = vec![SqlWrite {
+            sql: "SELECT 123".to_string(),
+            user_id: None,
+            force_sync: None,
+        }];
+        assert_eq!(
+            validate_inbound_batch_shape(&cfg, &too_large).unwrap_err(),
+            "sql too large"
+        );
     }
 }
