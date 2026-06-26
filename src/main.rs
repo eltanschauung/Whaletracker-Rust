@@ -14,6 +14,7 @@ const DEFAULT_MAX_BATCH_ROWS: usize = 256;
 const DEFAULT_MAX_FRAME_BYTES: usize = 32768;
 const DEFAULT_MAX_INBOUND_WRITES: usize = 256;
 const DEFAULT_MAX_SQL_BYTES: usize = 8192;
+const DEFAULT_MAX_QUEUE_ROWS: usize = 8192;
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
@@ -131,10 +132,19 @@ struct EnqueueResult {
     completion: Option<Arc<BatchCompletion>>,
 }
 
+#[derive(Debug)]
+struct EnqueueError {
+    message: &'static str,
+    queued: usize,
+    incoming: usize,
+    limit: usize,
+}
+
 #[derive(Debug, Clone)]
 struct SinkConfig {
     flush_interval: Duration,
     max_batch_rows: usize,
+    max_queue_rows: usize,
 }
 
 #[derive(Clone)]
@@ -1147,7 +1157,11 @@ impl SqlSink {
         }
     }
 
-    fn enqueue_batch(&self, batch_id: Option<i64>, writes: Vec<SqlWrite>) -> EnqueueResult {
+    fn enqueue_batch(
+        &self,
+        batch_id: Option<i64>,
+        writes: Vec<SqlWrite>,
+    ) -> Result<EnqueueResult, EnqueueError> {
         let now_ms = now_ms();
         let mut accepted_writes = Vec::new();
         let mut touched_online = false;
@@ -1179,6 +1193,20 @@ impl SqlSink {
         }
 
         let accepted = accepted_writes.len();
+        let queued = self.queue_depth();
+        let queue_limit = self.lanes[0].cfg.max_queue_rows;
+        if accepted > 0 && queued.saturating_add(accepted) > queue_limit {
+            self.stats
+                .dropped_writes
+                .fetch_add(accepted as u64, Ordering::Relaxed);
+            return Err(EnqueueError {
+                message: "queue full",
+                queued,
+                incoming: accepted,
+                limit: queue_limit,
+            });
+        }
+
         let completion = (accepted > 0).then(|| Arc::new(BatchCompletion::new(accepted)));
 
         for (write, lane_kind) in accepted_writes {
@@ -1215,10 +1243,10 @@ impl SqlSink {
             }
         }
 
-        EnqueueResult {
+        Ok(EnqueueResult {
             accepted,
             completion,
-        }
+        })
     }
 
     fn queue_depth(&self) -> usize {
@@ -1306,6 +1334,11 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_BATCH_ROWS);
+    let max_queue_rows = std::env::var("WT_RUST_MAX_QUEUE_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_QUEUE_ROWS)
+        .clamp(1, 1_000_000);
     let max_frame_bytes = std::env::var("WT_RUST_MAX_FRAME_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1366,13 +1399,15 @@ fn main() -> std::io::Result<()> {
             SinkConfig {
                 flush_interval: Duration::from_millis(flush_interval_ms.max(1)),
                 max_batch_rows: max_batch_rows.max(1),
+                max_queue_rows,
             },
             Some(Arc::clone(&points_cache)),
         )
         .map_err(|e| std::io::Error::other(format!("db init failed: {e}")))?,
     );
     println!(
-        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_frame_bytes={}, max_inbound_writes={}, max_sql_bytes={}, auth_required={})",
+        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_queue_rows={}, max_frame_bytes={}, max_inbound_writes={}, max_sql_bytes={}, auth_required={})",
+        max_queue_rows,
         protocol_cfg.max_frame_bytes,
         protocol_cfg.max_inbound_writes,
         protocol_cfg.max_sql_bytes,
@@ -1554,7 +1589,24 @@ fn handle_client(
                         batch_id, force_sync_count
                     );
                 }
-                let enqueue = sink.enqueue_batch(batch_id, writes);
+                let enqueue = match sink.enqueue_batch(batch_id, writes) {
+                    Ok(enqueue) => enqueue,
+                    Err(err) => {
+                        eprintln!(
+                            "[sql-sink] rejected batch {:?} from {:?}: {} (queued={}, incoming={}, limit={})",
+                            batch_id, peer, err.message, err.queued, err.incoming, err.limit
+                        );
+                        send_json_line(
+                            &mut writer,
+                            &ErrorResponse {
+                                r#type: "error",
+                                message: err.message,
+                                ts: now_secs(),
+                            },
+                        )?;
+                        continue;
+                    }
+                };
                 let completion = enqueue
                     .completion
                     .as_ref()
