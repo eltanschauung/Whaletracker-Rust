@@ -1,6 +1,6 @@
 use mysql::{params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +18,7 @@ const DEFAULT_MAX_SQL_BYTES: usize = 8192;
 const DEFAULT_MAX_QUEUE_ROWS: usize = 8192;
 const DEFAULT_DEDUPE_EVENTS: usize = 65536;
 const DEFAULT_DEAD_LETTER_PATH: &str = "sql_dead_letters.log";
+const DEFAULT_PENDING_JOURNAL_PATH: &str = "sql_pending_journal.log";
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
@@ -274,6 +275,169 @@ impl DeadLetterWriter {
         }
         if let Err(err) = file.write_all(b"\n").and_then(|_| file.flush()) {
             eprintln!("[sql-sink] failed to write dead-letter entry: {}", err);
+        }
+    }
+}
+
+struct PendingJournal {
+    file: Option<Mutex<File>>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct JournalPendingWrite {
+    event_id: String,
+    sql: String,
+    user_id: Option<u32>,
+    batch_id: Option<i64>,
+    ts_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct JournalReplayState {
+    pending: Vec<JournalPendingWrite>,
+    done_records: usize,
+    bad_lines: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PendingJournalRecord {
+    Pending {
+        event_id: String,
+        sql: String,
+        user_id: Option<u32>,
+        batch_id: Option<i64>,
+        ts_ms: u64,
+    },
+    Done {
+        event_id: String,
+        ts_ms: u64,
+    },
+}
+
+impl PendingJournal {
+    fn from_env() -> Result<Self, String> {
+        let path = std::env::var("WT_RUST_PENDING_JOURNAL_PATH")
+            .unwrap_or_else(|_| DEFAULT_PENDING_JOURNAL_PATH.to_string());
+        if path.trim().is_empty() {
+            println!("[sql-sink] pending journal disabled");
+            return Ok(Self {
+                file: None,
+                path: None,
+            });
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .map_err(|err| format!("failed to open pending journal {}: {}", path, err))?;
+        println!("[sql-sink] pending journal path={}", path);
+        Ok(Self {
+            file: Some(Mutex::new(file)),
+            path: Some(path),
+        })
+    }
+
+    fn append_pending(
+        &self,
+        event_id: &str,
+        sql: &str,
+        user_id: Option<u32>,
+        batch_id: Option<i64>,
+    ) -> Result<(), String> {
+        self.append_record(&PendingJournalRecord::Pending {
+            event_id: event_id.to_string(),
+            sql: sql.to_string(),
+            user_id,
+            batch_id,
+            ts_ms: now_ms_u64(),
+        })
+    }
+
+    fn append_done(&self, event_id: &str) -> Result<(), String> {
+        self.append_record(&PendingJournalRecord::Done {
+            event_id: event_id.to_string(),
+            ts_ms: now_ms_u64(),
+        })
+    }
+
+    fn append_record(&self, record: &PendingJournalRecord) -> Result<(), String> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+
+        let mut file = file.lock().expect("pending journal mutex poisoned");
+        serde_json::to_writer(&mut *file, record).map_err(|err| err.to_string())?;
+        file.write_all(b"\n").map_err(|err| err.to_string())?;
+        file.flush().map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn load_replay_state(&self, dedupe: &DedupeCache) -> JournalReplayState {
+        let Some(path) = &self.path else {
+            return JournalReplayState::default();
+        };
+        Self::load_replay_state_from_path(path, dedupe)
+    }
+
+    fn load_replay_state_from_path(path: &str, dedupe: &DedupeCache) -> JournalReplayState {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("[sql-sink] failed to read pending journal {}: {}", path, err);
+                return JournalReplayState::default();
+            }
+        };
+
+        let mut pending = HashMap::<String, JournalPendingWrite>::new();
+        let mut done_records = 0usize;
+        let mut bad_lines = 0usize;
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                bad_lines += 1;
+                continue;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<PendingJournalRecord>(&line) {
+                Ok(PendingJournalRecord::Pending {
+                    event_id,
+                    sql,
+                    user_id,
+                    batch_id,
+                    ts_ms,
+                }) => {
+                    pending.insert(
+                        event_id.clone(),
+                        JournalPendingWrite {
+                            event_id,
+                            sql,
+                            user_id,
+                            batch_id,
+                            ts_ms,
+                        },
+                    );
+                }
+                Ok(PendingJournalRecord::Done { event_id, .. }) => {
+                    pending.remove(&event_id);
+                    dedupe.remember(&event_id);
+                    done_records += 1;
+                }
+                Err(err) => {
+                    bad_lines += 1;
+                    eprintln!("[sql-sink] bad pending journal line: {} | {}", err, line);
+                }
+            }
+        }
+
+        JournalReplayState {
+            pending: pending.into_values().collect(),
+            done_records,
+            bad_lines,
         }
     }
 }
@@ -1130,6 +1294,7 @@ struct LaneWorker {
     points_cache: Option<Arc<PointsCacheManager>>,
     dedupe: Arc<DedupeCache>,
     dead_letters: Arc<DeadLetterWriter>,
+    pending_journal: Arc<PendingJournal>,
 }
 
 impl LaneWorker {
@@ -1140,6 +1305,7 @@ impl LaneWorker {
         points_cache: Option<Arc<PointsCacheManager>>,
         dedupe: Arc<DedupeCache>,
         dead_letters: Arc<DeadLetterWriter>,
+        pending_journal: Arc<PendingJournal>,
     ) -> Self {
         Self {
             lane,
@@ -1151,6 +1317,7 @@ impl LaneWorker {
             points_cache,
             dedupe,
             dead_letters,
+            pending_journal,
         }
     }
 
@@ -1222,6 +1389,14 @@ impl LaneWorker {
                             item.source_batch_id
                         );
                         if let Some(event_id) = &item.event_id {
+                            if let Err(err) = self.pending_journal.append_done(event_id) {
+                                eprintln!(
+                                    "[sql-sink:{}] failed to mark journal done event_id={}: {}",
+                                    self.lane.label(),
+                                    event_id,
+                                    err
+                                );
+                            }
                             self.dedupe.remember(event_id);
                         }
                         true
@@ -1262,6 +1437,7 @@ struct SqlSink {
     stats: Arc<SinkStats>,
     dedupe: Arc<DedupeCache>,
     dead_letters: Arc<DeadLetterWriter>,
+    pending_journal: Arc<PendingJournal>,
 }
 
 impl SqlSink {
@@ -1273,6 +1449,7 @@ impl SqlSink {
         let mut lanes = Vec::with_capacity(SqlLane::ALL.len());
         let dedupe = Arc::new(DedupeCache::new(cfg.max_dedupe_events));
         let dead_letters = Arc::new(DeadLetterWriter::from_env());
+        let pending_journal = Arc::new(PendingJournal::from_env()?);
         for lane in SqlLane::ALL {
             let db = MysqlDbExecutor::connect(db_cfg)?;
             let lane_points_cache = if lane == SqlLane::Stats {
@@ -1287,6 +1464,7 @@ impl SqlSink {
                 lane_points_cache,
                 Arc::clone(&dedupe),
                 Arc::clone(&dead_letters),
+                Arc::clone(&pending_journal),
             )));
         }
         Ok(Self {
@@ -1294,6 +1472,7 @@ impl SqlSink {
             stats: Arc::new(SinkStats::default()),
             dedupe,
             dead_letters,
+            pending_journal,
         })
     }
 
@@ -1303,6 +1482,80 @@ impl SqlSink {
             let global_stats = Arc::clone(&self.stats);
             thread::spawn(move || lane.worker_loop(global_stats));
         }
+    }
+
+    fn replay_pending_journal(&self) -> Result<(), String> {
+        let replay = self.pending_journal.load_replay_state(&self.dedupe);
+        if replay.pending.is_empty() {
+            println!(
+                "[sql-sink] pending journal replay: pending=0 done_records={} bad_lines={}",
+                replay.done_records, replay.bad_lines
+            );
+            return Ok(());
+        }
+
+        let total = replay.pending.len();
+        let mut replayed = 0usize;
+        for write in replay.pending {
+            if self.enqueue_replayed_write(write)? {
+                replayed += 1;
+            }
+        }
+        println!(
+            "[sql-sink] pending journal replay: replayed={}/{} done_records={} bad_lines={}",
+            replayed, total, replay.done_records, replay.bad_lines
+        );
+        Ok(())
+    }
+
+    fn enqueue_replayed_write(&self, write: JournalPendingWrite) -> Result<bool, String> {
+        if self.dedupe.contains(&write.event_id) {
+            return Ok(false);
+        }
+        if let Err(reason) = validate_sql_write(&write.sql) {
+            self.stats.dropped_writes.fetch_add(1, Ordering::Relaxed);
+            self.dead_letters.record(
+                "journal_invalid_write",
+                Some(&reason),
+                &write.sql,
+                write.user_id,
+                write.batch_id,
+                Some(&write.event_id),
+            );
+            if let Err(err) = self.pending_journal.append_done(&write.event_id) {
+                eprintln!(
+                    "[sql-sink] failed to suppress invalid replay event_id={}: {}",
+                    write.event_id, err
+                );
+            }
+            return Ok(false);
+        }
+
+        let queued = self.queue_depth();
+        let queue_limit = self.lanes[0].cfg.max_queue_rows;
+        if queued.saturating_add(1) > queue_limit {
+            return Err(format!(
+                "pending journal replay would exceed queue limit: queued={} limit={}",
+                queued, queue_limit
+            ));
+        }
+
+        let lane_kind = Self::lane_for_sql(&write.sql);
+        let lane = self.lane_by_kind(lane_kind);
+        let mut q = lane.queue.lock().expect("lane queue mutex poisoned");
+        q.push_back(QueuedSqlWrite {
+            sql: write.sql,
+            user_id: write.user_id,
+            event_id: Some(write.event_id),
+            source_batch_id: write.batch_id,
+            enqueued_at_ms: write.ts_ms as u128,
+            completion: None,
+        });
+        drop(q);
+        lane.stats.accepted_writes.fetch_add(1, Ordering::Relaxed);
+        self.stats.accepted_writes.fetch_add(1, Ordering::Relaxed);
+        lane.notify.notify_one();
+        Ok(true)
     }
 
     fn lane_for_sql(sql: &str) -> SqlLane {
@@ -1388,6 +1641,31 @@ impl SqlSink {
                 incoming: accepted,
                 limit: queue_limit,
             });
+        }
+
+        for (write, _) in &accepted_writes {
+            if let Some(event_id) = write.event_id.as_deref() {
+                if let Err(err) = self.pending_journal.append_pending(
+                    event_id,
+                    &write.sql,
+                    write.user_id,
+                    batch_id,
+                ) {
+                    self.stats
+                        .dropped_writes
+                        .fetch_add(accepted as u64, Ordering::Relaxed);
+                    eprintln!(
+                        "[sql-sink] failed to append pending journal event_id={} batch_id={:?}: {}",
+                        event_id, batch_id, err
+                    );
+                    return Err(EnqueueError {
+                        message: "journal write failed",
+                        queued,
+                        incoming: accepted,
+                        limit: queue_limit,
+                    });
+                }
+            }
         }
 
         let completion = (accepted > 0).then(|| Arc::new(BatchCompletion::new(accepted)));
@@ -1607,6 +1885,8 @@ fn main() -> std::io::Result<()> {
         protocol_cfg.max_sql_bytes,
         protocol_auth_required(&protocol_cfg) as u8
     );
+    sink.replay_pending_journal()
+        .map_err(|e| std::io::Error::other(format!("pending journal replay failed: {e}")))?;
     sink.spawn_workers();
     points_cache.spawn_worker();
 
@@ -2337,5 +2617,56 @@ mod tests {
         assert!(!cache.contains("event-a"));
         assert!(cache.contains("event-b"));
         assert!(cache.contains("event-c"));
+    }
+
+    #[test]
+    fn pending_journal_replays_only_unfinished_events() {
+        let path = std::env::temp_dir().join(format!("whaletracker-journal-{}.log", now_ms_u64()));
+        {
+            let mut file = File::create(&path).unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &PendingJournalRecord::Pending {
+                    event_id: "event-a".to_string(),
+                    sql: "SELECT 1".to_string(),
+                    user_id: Some(1),
+                    batch_id: Some(10),
+                    ts_ms: 100,
+                },
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &PendingJournalRecord::Pending {
+                    event_id: "event-b".to_string(),
+                    sql: "SELECT 2".to_string(),
+                    user_id: Some(2),
+                    batch_id: Some(11),
+                    ts_ms: 200,
+                },
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &PendingJournalRecord::Done {
+                    event_id: "event-a".to_string(),
+                    ts_ms: 300,
+                },
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+
+        let dedupe = DedupeCache::new(10);
+        let state = PendingJournal::load_replay_state_from_path(path.to_str().unwrap(), &dedupe);
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[0].event_id, "event-b");
+        assert_eq!(state.done_records, 1);
+        assert!(dedupe.contains("event-a"));
+        assert!(!dedupe.contains("event-b"));
     }
 }
