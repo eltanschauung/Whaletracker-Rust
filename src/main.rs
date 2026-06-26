@@ -67,6 +67,68 @@ struct QueuedSqlWrite {
     user_id: Option<u32>,
     source_batch_id: Option<i64>,
     enqueued_at_ms: u128,
+    completion: Option<Arc<BatchCompletion>>,
+}
+
+#[derive(Debug)]
+struct BatchCompletion {
+    state: Mutex<BatchCompletionState>,
+    notify: Condvar,
+}
+
+#[derive(Debug)]
+struct BatchCompletionState {
+    remaining: usize,
+    executed: usize,
+    db_errors: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchCompletionSnapshot {
+    executed: usize,
+    db_errors: usize,
+}
+
+impl BatchCompletion {
+    fn new(remaining: usize) -> Self {
+        Self {
+            state: Mutex::new(BatchCompletionState {
+                remaining,
+                executed: 0,
+                db_errors: 0,
+            }),
+            notify: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, success: bool) {
+        let mut state = self.state.lock().expect("batch completion mutex poisoned");
+        state.remaining = state.remaining.saturating_sub(1);
+        if success {
+            state.executed += 1;
+        } else {
+            state.db_errors += 1;
+        }
+        if state.remaining == 0 {
+            self.notify.notify_all();
+        }
+    }
+
+    fn wait(&self) -> BatchCompletionSnapshot {
+        let mut state = self.state.lock().expect("batch completion mutex poisoned");
+        while state.remaining > 0 {
+            state = self.notify.wait(state).expect("batch completion wait failed");
+        }
+        BatchCompletionSnapshot {
+            executed: state.executed,
+            db_errors: state.db_errors,
+        }
+    }
+}
+
+struct EnqueueResult {
+    accepted: usize,
+    completion: Option<Arc<BatchCompletion>>,
 }
 
 #[derive(Debug, Clone)]
@@ -983,7 +1045,7 @@ impl LaneWorker {
                     db.execute(&item.sql)
                 };
 
-                match result {
+                let success = match result {
                     Ok(()) => {
                         self.stats.executed_writes.fetch_add(1, Ordering::Relaxed);
                         global_stats.executed_writes.fetch_add(1, Ordering::Relaxed);
@@ -1004,6 +1066,7 @@ impl LaneWorker {
                             kind,
                             item.source_batch_id
                         );
+                        true
                     }
                     Err(err) => {
                         self.stats.db_errors.fetch_add(1, Ordering::Relaxed);
@@ -1017,7 +1080,11 @@ impl LaneWorker {
                             err,
                             preview_sql(&item.sql, 256)
                         );
+                        false
                     }
+                };
+                if let Some(completion) = &item.completion {
+                    completion.finish(success);
                 }
             }
         }
@@ -1080,9 +1147,9 @@ impl SqlSink {
         }
     }
 
-    fn enqueue_batch(&self, batch_id: Option<i64>, writes: Vec<SqlWrite>) -> usize {
+    fn enqueue_batch(&self, batch_id: Option<i64>, writes: Vec<SqlWrite>) -> EnqueueResult {
         let now_ms = now_ms();
-        let mut accepted = 0usize;
+        let mut accepted_writes = Vec::new();
         let mut touched_online = false;
         let mut touched_stats = false;
         let mut touched_logs = false;
@@ -1108,6 +1175,13 @@ impl SqlSink {
             }
 
             let lane_kind = Self::lane_for_sql(sql);
+            accepted_writes.push((write, lane_kind));
+        }
+
+        let accepted = accepted_writes.len();
+        let completion = (accepted > 0).then(|| Arc::new(BatchCompletion::new(accepted)));
+
+        for (write, lane_kind) in accepted_writes {
             let lane = self.lane_by_kind(lane_kind);
             let mut q = lane.queue.lock().expect("lane queue mutex poisoned");
             q.push_back(QueuedSqlWrite {
@@ -1115,6 +1189,7 @@ impl SqlSink {
                 user_id: write.user_id,
                 source_batch_id: batch_id,
                 enqueued_at_ms: now_ms,
+                completion: completion.clone(),
             });
             drop(q);
             lane.stats.accepted_writes.fetch_add(1, Ordering::Relaxed);
@@ -1123,7 +1198,6 @@ impl SqlSink {
                 SqlLane::Stats => touched_stats = true,
                 SqlLane::Logs => touched_logs = true,
             }
-            accepted += 1;
         }
 
         if accepted > 0 {
@@ -1141,7 +1215,10 @@ impl SqlSink {
             }
         }
 
-        accepted
+        EnqueueResult {
+            accepted,
+            completion,
+        }
     }
 
     fn queue_depth(&self) -> usize {
@@ -1181,6 +1258,8 @@ struct AckResponse<'a> {
     r#type: &'a str,
     batch_id: Option<i64>,
     accepted: usize,
+    executed: usize,
+    db_errors: usize,
     queue_depth: usize,
     ts: u64,
 }
@@ -1475,13 +1554,23 @@ fn handle_client(
                         batch_id, force_sync_count
                     );
                 }
-                let accepted = sink.enqueue_batch(batch_id, writes);
+                let enqueue = sink.enqueue_batch(batch_id, writes);
+                let completion = enqueue
+                    .completion
+                    .as_ref()
+                    .map(|completion| completion.wait())
+                    .unwrap_or(BatchCompletionSnapshot {
+                        executed: 0,
+                        db_errors: 0,
+                    });
                 if let Some(sent_at) = sent_at {
                     println!(
-                        "[sql-sink] batch {:?}: accepted {}/{} writes (queue_depth={}, sent_at={}, online_related={})",
+                        "[sql-sink] batch {:?}: accepted {}/{} writes, executed={}, db_errors={} (queue_depth={}, sent_at={}, online_related={})",
                         batch_id,
-                        accepted,
+                        enqueue.accepted,
                         total,
+                        completion.executed,
+                        completion.db_errors,
                         sink.queue_depth(),
                         sent_at,
                         online_writes
@@ -1492,7 +1581,9 @@ fn handle_client(
                     &AckResponse {
                         r#type: "ack",
                         batch_id,
-                        accepted,
+                        accepted: enqueue.accepted,
+                        executed: completion.executed,
+                        db_errors: completion.db_errors,
                         queue_depth: sink.queue_depth(),
                         ts: now_secs(),
                     },
