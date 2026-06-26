@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DEFAULT_BIND: &str = "127.0.0.1:28017";
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 100;
 const DEFAULT_MAX_BATCH_ROWS: usize = 256;
+const DEFAULT_MAX_FRAME_BYTES: usize = 32768;
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
@@ -70,6 +71,11 @@ struct QueuedSqlWrite {
 struct SinkConfig {
     flush_interval: Duration,
     max_batch_rows: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ProtocolConfig {
+    max_frame_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1196,6 +1202,7 @@ struct HealthResponse<'a> {
     executed_writes: u64,
     db_errors: u64,
     parse_errors: u64,
+    dropped_writes: u64,
     ts: u64,
 }
 
@@ -1214,6 +1221,12 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_BATCH_ROWS);
+    let max_frame_bytes = std::env::var("WT_RUST_MAX_FRAME_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
+        .clamp(1024, 1024 * 1024);
+    let protocol_cfg = ProtocolConfig { max_frame_bytes };
     let db_cfg = DbConfig::from_env();
 
     println!(
@@ -1257,7 +1270,10 @@ fn main() -> std::io::Result<()> {
         )
         .map_err(|e| std::io::Error::other(format!("db init failed: {e}")))?,
     );
-    println!("[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs)");
+    println!(
+        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_frame_bytes={})",
+        protocol_cfg.max_frame_bytes
+    );
     sink.spawn_workers();
     points_cache.spawn_worker();
 
@@ -1268,8 +1284,9 @@ fn main() -> std::io::Result<()> {
         match incoming {
             Ok(stream) => {
                 let sink = Arc::clone(&sink);
+                let protocol_cfg = protocol_cfg;
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, sink) {
+                    if let Err(e) = handle_client(stream, sink, protocol_cfg) {
                         eprintln!("[sql-sink] client handler error: {}", e);
                     }
                 });
@@ -1283,7 +1300,11 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_client(stream: TcpStream, sink: Arc<SqlSink>) -> std::io::Result<()> {
+fn handle_client(
+    stream: TcpStream,
+    sink: Arc<SqlSink>,
+    protocol_cfg: ProtocolConfig,
+) -> std::io::Result<()> {
     let peer = stream.peer_addr().ok();
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
@@ -1293,20 +1314,29 @@ fn handle_client(stream: TcpStream, sink: Arc<SqlSink>) -> std::io::Result<()> {
 
     let mut buf = Vec::with_capacity(4096);
     loop {
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            break;
-        }
-
-        if let Some(b'\n') = buf.last().copied() {
-            buf.pop();
-        }
-        if let Some(b'\r') = buf.last().copied() {
-            buf.pop();
-        }
-        if buf.is_empty() {
-            continue;
+        match read_protocol_frame(&mut reader, protocol_cfg.max_frame_bytes, &mut buf)? {
+            FrameRead::Eof => break,
+            FrameRead::TooLong => {
+                sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[sql-sink] frame too large from {:?}: max_frame_bytes={}",
+                    peer, protocol_cfg.max_frame_bytes
+                );
+                send_json_line(
+                    &mut writer,
+                    &ErrorResponse {
+                        r#type: "error",
+                        message: "frame too large",
+                        ts: now_secs(),
+                    },
+                )?;
+                continue;
+            }
+            FrameRead::Line => {
+                if buf.is_empty() {
+                    continue;
+                }
+            }
         }
 
         let line = match std::str::from_utf8(&buf) {
@@ -1404,6 +1434,7 @@ fn handle_client(stream: TcpStream, sink: Arc<SqlSink>) -> std::io::Result<()> {
                         executed_writes: sink.stats.executed_writes.load(Ordering::Relaxed),
                         db_errors: sink.stats.db_errors.load(Ordering::Relaxed),
                         parse_errors: sink.stats.parse_errors.load(Ordering::Relaxed),
+                        dropped_writes: sink.stats.dropped_writes.load(Ordering::Relaxed),
                         ts: now_secs(),
                     },
                 )?;
@@ -1425,6 +1456,77 @@ fn handle_client(stream: TcpStream, sink: Arc<SqlSink>) -> std::io::Result<()> {
 
     println!("[sql-sink] client disconnected: {:?}", peer);
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FrameRead {
+    Line,
+    Eof,
+    TooLong,
+}
+
+fn read_protocol_frame<R: BufRead>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+    out: &mut Vec<u8>,
+) -> std::io::Result<FrameRead> {
+    out.clear();
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if out.is_empty() {
+                return Ok(FrameRead::Eof);
+            }
+            trim_frame_cr(out);
+            return Ok(FrameRead::Line);
+        }
+
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let take_len = newline_pos.unwrap_or(available.len());
+
+        if out.len().saturating_add(take_len) > max_frame_bytes {
+            let consume_len = newline_pos.map(|pos| pos + 1).unwrap_or(available.len());
+            reader.consume(consume_len);
+            if newline_pos.is_none() {
+                drain_protocol_frame(reader)?;
+            }
+            out.clear();
+            return Ok(FrameRead::TooLong);
+        }
+
+        out.extend_from_slice(&available[..take_len]);
+        let consume_len = newline_pos.map(|pos| pos + 1).unwrap_or(available.len());
+        reader.consume(consume_len);
+
+        if newline_pos.is_some() {
+            trim_frame_cr(out);
+            return Ok(FrameRead::Line);
+        }
+    }
+}
+
+fn drain_protocol_frame<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            reader.consume(newline_pos + 1);
+            return Ok(());
+        }
+
+        let consume_len = available.len();
+        reader.consume(consume_len);
+    }
+}
+
+fn trim_frame_cr(frame: &mut Vec<u8>) {
+    if frame.last().copied() == Some(b'\r') {
+        frame.pop();
+    }
 }
 
 fn send_json_line<T: Serialize>(writer: &mut TcpStream, value: &T) -> std::io::Result<()> {
@@ -1672,5 +1774,36 @@ mod tests {
         let sql = "INSERT INTO whaletracker_log_players (log_id, steamid, personaname, damage, damage_taken, playtime) VALUES ('log', 'steam', 'name', 4738, 0, 22)";
 
         assert!(validate_sql_write(sql).is_err());
+    }
+
+    #[test]
+    fn reads_protocol_frame_with_crlf() {
+        let input = std::io::Cursor::new(b"{\"type\":\"health\"}\r\n".to_vec());
+        let mut reader = std::io::BufReader::new(input);
+        let mut out = Vec::new();
+
+        assert_eq!(
+            read_protocol_frame(&mut reader, 64, &mut out).unwrap(),
+            FrameRead::Line
+        );
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "{\"type\":\"health\"}");
+    }
+
+    #[test]
+    fn rejects_and_drains_oversized_protocol_frame() {
+        let input = std::io::Cursor::new(b"abcdef\nok\n".to_vec());
+        let mut reader = std::io::BufReader::new(input);
+        let mut out = Vec::new();
+
+        assert_eq!(
+            read_protocol_frame(&mut reader, 4, &mut out).unwrap(),
+            FrameRead::TooLong
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            read_protocol_frame(&mut reader, 4, &mut out).unwrap(),
+            FrameRead::Line
+        );
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "ok");
     }
 }
