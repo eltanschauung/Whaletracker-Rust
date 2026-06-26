@@ -1,6 +1,7 @@
 use mysql::{params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +17,7 @@ const DEFAULT_MAX_INBOUND_WRITES: usize = 256;
 const DEFAULT_MAX_SQL_BYTES: usize = 8192;
 const DEFAULT_MAX_QUEUE_ROWS: usize = 8192;
 const DEFAULT_DEDUPE_EVENTS: usize = 65536;
+const DEFAULT_DEAD_LETTER_PATH: &str = "sql_dead_letters.log";
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
@@ -197,6 +199,82 @@ impl DedupeCache {
             .expect("dedupe mutex poisoned")
             .seen
             .len()
+    }
+}
+
+struct DeadLetterWriter {
+    file: Option<Mutex<File>>,
+}
+
+#[derive(Serialize)]
+struct DeadLetterEntry<'a> {
+    ts_ms: u64,
+    reason: &'a str,
+    detail: Option<&'a str>,
+    kind: &'a str,
+    user_id: Option<u32>,
+    batch_id: Option<i64>,
+    event_id: Option<&'a str>,
+    sql: &'a str,
+}
+
+impl DeadLetterWriter {
+    fn from_env() -> Self {
+        let path = std::env::var("WT_RUST_DEAD_LETTER_PATH")
+            .unwrap_or_else(|_| DEFAULT_DEAD_LETTER_PATH.to_string());
+        if path.trim().is_empty() {
+            println!("[sql-sink] dead-letter journal disabled");
+            return Self { file: None };
+        }
+
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => {
+                println!("[sql-sink] dead-letter journal path={}", path);
+                Self {
+                    file: Some(Mutex::new(file)),
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[sql-sink] failed to open dead-letter journal {}: {}",
+                    path, err
+                );
+                Self { file: None }
+            }
+        }
+    }
+
+    fn record(
+        &self,
+        reason: &str,
+        detail: Option<&str>,
+        sql: &str,
+        user_id: Option<u32>,
+        batch_id: Option<i64>,
+        event_id: Option<&str>,
+    ) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        let entry = DeadLetterEntry {
+            ts_ms: now_ms_u64(),
+            reason,
+            detail,
+            kind: classify_sql(sql),
+            user_id,
+            batch_id,
+            event_id,
+            sql,
+        };
+
+        let mut file = file.lock().expect("dead-letter mutex poisoned");
+        if let Err(err) = serde_json::to_writer(&mut *file, &entry) {
+            eprintln!("[sql-sink] failed to encode dead-letter entry: {}", err);
+            return;
+        }
+        if let Err(err) = file.write_all(b"\n").and_then(|_| file.flush()) {
+            eprintln!("[sql-sink] failed to write dead-letter entry: {}", err);
+        }
     }
 }
 
@@ -1051,6 +1129,7 @@ struct LaneWorker {
     stats: LaneStats,
     points_cache: Option<Arc<PointsCacheManager>>,
     dedupe: Arc<DedupeCache>,
+    dead_letters: Arc<DeadLetterWriter>,
 }
 
 impl LaneWorker {
@@ -1060,6 +1139,7 @@ impl LaneWorker {
         cfg: SinkConfig,
         points_cache: Option<Arc<PointsCacheManager>>,
         dedupe: Arc<DedupeCache>,
+        dead_letters: Arc<DeadLetterWriter>,
     ) -> Self {
         Self {
             lane,
@@ -1070,6 +1150,7 @@ impl LaneWorker {
             stats: LaneStats::default(),
             points_cache,
             dedupe,
+            dead_letters,
         }
     }
 
@@ -1157,6 +1238,14 @@ impl LaneWorker {
                             err,
                             preview_sql(&item.sql, 256)
                         );
+                        self.dead_letters.record(
+                            "db_error",
+                            Some(&err),
+                            &item.sql,
+                            item.user_id,
+                            item.source_batch_id,
+                            item.event_id.as_deref(),
+                        );
                         false
                     }
                 };
@@ -1172,6 +1261,7 @@ struct SqlSink {
     lanes: Vec<Arc<LaneWorker>>,
     stats: Arc<SinkStats>,
     dedupe: Arc<DedupeCache>,
+    dead_letters: Arc<DeadLetterWriter>,
 }
 
 impl SqlSink {
@@ -1182,6 +1272,7 @@ impl SqlSink {
     ) -> Result<Self, String> {
         let mut lanes = Vec::with_capacity(SqlLane::ALL.len());
         let dedupe = Arc::new(DedupeCache::new(cfg.max_dedupe_events));
+        let dead_letters = Arc::new(DeadLetterWriter::from_env());
         for lane in SqlLane::ALL {
             let db = MysqlDbExecutor::connect(db_cfg)?;
             let lane_points_cache = if lane == SqlLane::Stats {
@@ -1195,12 +1286,14 @@ impl SqlSink {
                 cfg.clone(),
                 lane_points_cache,
                 Arc::clone(&dedupe),
+                Arc::clone(&dead_letters),
             )));
         }
         Ok(Self {
             lanes,
             stats: Arc::new(SinkStats::default()),
             dedupe,
+            dead_letters,
         })
     }
 
@@ -1255,6 +1348,14 @@ impl SqlSink {
                     batch_id,
                     reason,
                     preview_sql(sql, 256)
+                );
+                self.dead_letters.record(
+                    "invalid_write",
+                    Some(&reason),
+                    sql,
+                    write.user_id,
+                    batch_id,
+                    write.event_id.as_deref(),
                 );
                 continue;
             }
