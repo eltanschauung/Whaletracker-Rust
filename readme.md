@@ -29,6 +29,8 @@ Example `sql_batch` payload:
 {"type":"sql_batch","batch_id":12,"sent_at":1700000000,"writes":[{"sql":"INSERT INTO whaletracker ...","user_id":34,"event_id":"kogasa.tf:27015:1700000000:123"}]}
 ```
 
+Typed writes can be sent in the same `writes` array. Supported typed write kinds currently are `online_remove`, `online_clear_host`, and `server_clear_port`; Rust materializes those into SQL internally.
+
 When `WT_RUST_AUTH_TOKEN` is non-empty, SourceMod must send the same value through `sm_whaletracker_rust_auth_token` in `hello` before `sql_batch` or `health` messages are accepted.
 
 ## rust environment knobs
