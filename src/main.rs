@@ -1352,6 +1352,11 @@ struct SinkStats {
     db_errors: AtomicU64,
     parse_errors: AtomicU64,
     dropped_writes: AtomicU64,
+    journal_pending_startup: AtomicU64,
+    journal_replayed_startup: AtomicU64,
+    journal_done_records_startup: AtomicU64,
+    journal_bad_lines_startup: AtomicU64,
+    journal_compactions: AtomicU64,
 }
 
 #[derive(Default)]
@@ -1564,6 +1569,18 @@ impl SqlSink {
     fn replay_pending_journal(&self) -> Result<(), String> {
         let replay = self.pending_journal.load_replay_state(&self.dedupe);
         self.pending_journal.compact_from_state(&replay)?;
+        self.stats
+            .journal_compactions
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .journal_pending_startup
+            .store(replay.pending.len() as u64, Ordering::Relaxed);
+        self.stats
+            .journal_done_records_startup
+            .store(replay.done_records as u64, Ordering::Relaxed);
+        self.stats
+            .journal_bad_lines_startup
+            .store(replay.bad_lines as u64, Ordering::Relaxed);
         if replay.pending.is_empty() {
             println!(
                 "[sql-sink] pending journal replay: pending=0 recent_done={} done_records={} bad_lines={}",
@@ -1581,6 +1598,9 @@ impl SqlSink {
                 replayed += 1;
             }
         }
+        self.stats
+            .journal_replayed_startup
+            .store(replayed as u64, Ordering::Relaxed);
         println!(
             "[sql-sink] pending journal replay: replayed={}/{} recent_done={} done_records={} bad_lines={}",
             replayed,
@@ -1798,6 +1818,14 @@ impl SqlSink {
     fn queue_depth(&self) -> usize {
         self.lanes.iter().map(|lane| lane.queue_depth()).sum()
     }
+
+    fn lane_queue_depths(&self) -> (usize, usize, usize) {
+        (
+            self.lane_by_kind(SqlLane::Online).queue_depth(),
+            self.lane_by_kind(SqlLane::Stats).queue_depth(),
+            self.lane_by_kind(SqlLane::Logs).queue_depth(),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1859,12 +1887,20 @@ struct HelloResponse<'a> {
 struct HealthResponse<'a> {
     r#type: &'a str,
     queue_depth: usize,
+    online_queue_depth: usize,
+    stats_queue_depth: usize,
+    logs_queue_depth: usize,
     dedupe_events: usize,
     accepted_writes: u64,
     executed_writes: u64,
     db_errors: u64,
     parse_errors: u64,
     dropped_writes: u64,
+    journal_pending_startup: u64,
+    journal_replayed_startup: u64,
+    journal_done_records_startup: u64,
+    journal_bad_lines_startup: u64,
+    journal_compactions: u64,
     ts: u64,
 }
 
@@ -2212,17 +2248,39 @@ fn handle_client(
                     )?;
                     continue;
                 }
+                let (online_queue_depth, stats_queue_depth, logs_queue_depth) =
+                    sink.lane_queue_depths();
                 send_json_line(
                     &mut writer,
                     &HealthResponse {
                         r#type: "health",
                         queue_depth: sink.queue_depth(),
+                        online_queue_depth,
+                        stats_queue_depth,
+                        logs_queue_depth,
                         dedupe_events: sink.dedupe.len(),
                         accepted_writes: sink.stats.accepted_writes.load(Ordering::Relaxed),
                         executed_writes: sink.stats.executed_writes.load(Ordering::Relaxed),
                         db_errors: sink.stats.db_errors.load(Ordering::Relaxed),
                         parse_errors: sink.stats.parse_errors.load(Ordering::Relaxed),
                         dropped_writes: sink.stats.dropped_writes.load(Ordering::Relaxed),
+                        journal_pending_startup: sink
+                            .stats
+                            .journal_pending_startup
+                            .load(Ordering::Relaxed),
+                        journal_replayed_startup: sink
+                            .stats
+                            .journal_replayed_startup
+                            .load(Ordering::Relaxed),
+                        journal_done_records_startup: sink
+                            .stats
+                            .journal_done_records_startup
+                            .load(Ordering::Relaxed),
+                        journal_bad_lines_startup: sink
+                            .stats
+                            .journal_bad_lines_startup
+                            .load(Ordering::Relaxed),
+                        journal_compactions: sink.stats.journal_compactions.load(Ordering::Relaxed),
                         ts: now_secs(),
                     },
                 )?;
