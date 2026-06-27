@@ -1,7 +1,7 @@
 use mysql::{params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -201,6 +201,10 @@ impl DedupeCache {
             .seen
             .len()
     }
+
+    fn capacity(&self) -> usize {
+        self.max_entries
+    }
 }
 
 struct DeadLetterWriter {
@@ -296,6 +300,7 @@ struct JournalPendingWrite {
 #[derive(Debug, Default)]
 struct JournalReplayState {
     pending: Vec<JournalPendingWrite>,
+    recent_done: Vec<String>,
     done_records: usize,
     bad_lines: usize,
 }
@@ -328,6 +333,10 @@ impl PendingJournal {
             });
         }
 
+        Self::open_path(path)
+    }
+
+    fn open_path(path: String) -> Result<Self, String> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -383,6 +392,62 @@ impl PendingJournal {
         Self::load_replay_state_from_path(path, dedupe)
     }
 
+    fn compact_from_state(&self, state: &JournalReplayState) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let Some(file_mutex) = &self.file else {
+            return Ok(());
+        };
+
+        let mut file = file_mutex.lock().expect("pending journal mutex poisoned");
+        file.sync_all().map_err(|err| err.to_string())?;
+
+        let tmp_path = format!("{}.compact.{}", path, now_ms_u64());
+        let result = (|| -> Result<(), String> {
+            let mut tmp = File::create(&tmp_path).map_err(|err| err.to_string())?;
+            for pending in &state.pending {
+                serde_json::to_writer(
+                    &mut tmp,
+                    &PendingJournalRecord::Pending {
+                        event_id: pending.event_id.clone(),
+                        sql: pending.sql.clone(),
+                        user_id: pending.user_id,
+                        batch_id: pending.batch_id,
+                        ts_ms: pending.ts_ms,
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+                tmp.write_all(b"\n").map_err(|err| err.to_string())?;
+            }
+            for event_id in &state.recent_done {
+                serde_json::to_writer(
+                    &mut tmp,
+                    &PendingJournalRecord::Done {
+                        event_id: event_id.clone(),
+                        ts_ms: now_ms_u64(),
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+                tmp.write_all(b"\n").map_err(|err| err.to_string())?;
+            }
+            tmp.sync_all().map_err(|err| err.to_string())?;
+            fs::rename(&tmp_path, path).map_err(|err| err.to_string())?;
+            *file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(path)
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        result
+    }
+
     fn load_replay_state_from_path(path: &str, dedupe: &DedupeCache) -> JournalReplayState {
         let file = match File::open(path) {
             Ok(file) => file,
@@ -393,8 +458,10 @@ impl PendingJournal {
         };
 
         let mut pending = HashMap::<String, JournalPendingWrite>::new();
+        let mut recent_done = VecDeque::<String>::new();
         let mut done_records = 0usize;
         let mut bad_lines = 0usize;
+        let done_capacity = dedupe.capacity();
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else {
                 bad_lines += 1;
@@ -425,6 +492,12 @@ impl PendingJournal {
                 Ok(PendingJournalRecord::Done { event_id, .. }) => {
                     pending.remove(&event_id);
                     dedupe.remember(&event_id);
+                    if done_capacity > 0 {
+                        recent_done.push_back(event_id);
+                        while recent_done.len() > done_capacity {
+                            recent_done.pop_front();
+                        }
+                    }
                     done_records += 1;
                 }
                 Err(err) => {
@@ -434,8 +507,12 @@ impl PendingJournal {
             }
         }
 
+        let mut pending = pending.into_values().collect::<Vec<_>>();
+        pending.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.event_id.cmp(&b.event_id)));
+
         JournalReplayState {
-            pending: pending.into_values().collect(),
+            pending,
+            recent_done: recent_done.into_iter().collect(),
             done_records,
             bad_lines,
         }
@@ -1486,10 +1563,13 @@ impl SqlSink {
 
     fn replay_pending_journal(&self) -> Result<(), String> {
         let replay = self.pending_journal.load_replay_state(&self.dedupe);
+        self.pending_journal.compact_from_state(&replay)?;
         if replay.pending.is_empty() {
             println!(
-                "[sql-sink] pending journal replay: pending=0 done_records={} bad_lines={}",
-                replay.done_records, replay.bad_lines
+                "[sql-sink] pending journal replay: pending=0 recent_done={} done_records={} bad_lines={}",
+                replay.recent_done.len(),
+                replay.done_records,
+                replay.bad_lines
             );
             return Ok(());
         }
@@ -1502,8 +1582,12 @@ impl SqlSink {
             }
         }
         println!(
-            "[sql-sink] pending journal replay: replayed={}/{} done_records={} bad_lines={}",
-            replayed, total, replay.done_records, replay.bad_lines
+            "[sql-sink] pending journal replay: replayed={}/{} recent_done={} done_records={} bad_lines={}",
+            replayed,
+            total,
+            replay.recent_done.len(),
+            replay.done_records,
+            replay.bad_lines
         );
         Ok(())
     }
@@ -2665,8 +2749,69 @@ mod tests {
 
         assert_eq!(state.pending.len(), 1);
         assert_eq!(state.pending[0].event_id, "event-b");
+        assert_eq!(state.recent_done, vec!["event-a".to_string()]);
         assert_eq!(state.done_records, 1);
         assert!(dedupe.contains("event-a"));
         assert!(!dedupe.contains("event-b"));
+    }
+
+    #[test]
+    fn pending_journal_compaction_keeps_pending_and_recent_done_only() {
+        let path = std::env::temp_dir().join(format!(
+            "whaletracker-journal-compact-{}-{}.log",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        {
+            let mut file = File::create(&path).unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &PendingJournalRecord::Pending {
+                    event_id: "event-a".to_string(),
+                    sql: "SELECT 1".to_string(),
+                    user_id: Some(1),
+                    batch_id: Some(10),
+                    ts_ms: 100,
+                },
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &PendingJournalRecord::Pending {
+                    event_id: "event-b".to_string(),
+                    sql: "SELECT 2".to_string(),
+                    user_id: Some(2),
+                    batch_id: Some(11),
+                    ts_ms: 200,
+                },
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &PendingJournalRecord::Done {
+                    event_id: "event-a".to_string(),
+                    ts_ms: 300,
+                },
+            )
+            .unwrap();
+            file.write_all(b"\nnot-json\n").unwrap();
+        }
+
+        let journal = PendingJournal::open_path(path.to_str().unwrap().to_string()).unwrap();
+        let dedupe = DedupeCache::new(10);
+        let state = journal.load_replay_state(&dedupe);
+        journal.compact_from_state(&state).unwrap();
+
+        let compacted = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(compacted.contains("event-a"));
+        assert!(compacted.contains("event-b"));
+        assert!(!compacted.contains("not-json"));
+        assert_eq!(compacted.lines().count(), 2);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.bad_lines, 1);
     }
 }
