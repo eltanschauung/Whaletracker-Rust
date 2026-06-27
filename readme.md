@@ -21,6 +21,8 @@ SourceMod sends `hello`, `sql_batch`, and `health`. Rust sends `hello_ack`, `ack
 
 `ack` is sent after accepted writes have completed worker execution and successful event ids have been marked done in the pending journal.
 
+The pending journal is compacted on startup to unresolved pending records plus a bounded recent-done horizon, using `WT_RUST_DEDUPE_EVENTS` as the cap.
+
 Example `sql_batch` payload:
 
 ```json
@@ -42,3 +44,7 @@ When `WT_RUST_AUTH_TOKEN` is non-empty, SourceMod must send the same value throu
 - `WT_RUST_AUTH_TOKEN` (optional)
 - `WT_RUST_PENDING_JOURNAL_PATH` (default `sql_pending_journal.log`, empty disables startup replay)
 - `WT_RUST_DEAD_LETTER_PATH` (default `sql_dead_letters.log`, empty disables)
+
+## health response fields
+
+`health` includes total and per-lane queue depths, dedupe event count, write/error counters, and startup journal replay counters (`journal_pending_startup`, `journal_replayed_startup`, `journal_done_records_startup`, `journal_bad_lines_startup`, `journal_compactions`).
