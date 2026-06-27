@@ -426,7 +426,7 @@ void QueryPointsCacheJoinMessage(int client)
 
     char query[512];
     Format(query, sizeof(query),
-        "SELECT points, name_color, name, prename, rank FROM whaletracker_points_cache WHERE steamid = '%s' LIMIT 1",
+        "SELECT points, name_color, rank FROM whaletracker_points_cache WHERE steamid = '%s' LIMIT 1",
         escapedSteamId);
     g_hDatabase.Query(WhaleTracker_JoinMessageQueryCallback, query, GetClientUserId(client));
 }
@@ -453,7 +453,7 @@ public void WhaleTracker_JoinMessageQueryCallback(Database db, DBResultSet resul
     }
 
     int points = results.FetchInt(0);
-    int rank = results.FetchInt(4);
+    int rank = results.FetchInt(2);
 
     if (points < 0)
     {
@@ -464,26 +464,8 @@ public void WhaleTracker_JoinMessageQueryCallback(Database db, DBResultSet resul
     results.FetchString(1, colorTag, sizeof(colorTag));
     TrimString(colorTag);
 
-    char cachedName[128];
-    char cachedPrename[128];
-    results.FetchString(2, cachedName, sizeof(cachedName));
-    results.FetchString(3, cachedPrename, sizeof(cachedPrename));
-    TrimString(cachedName);
-    TrimString(cachedPrename);
-
     char displayName[128];
-    if (cachedPrename[0] != '\0')
-    {
-        strcopy(displayName, sizeof(displayName), cachedPrename);
-    }
-    else if (cachedName[0] != '\0')
-    {
-        strcopy(displayName, sizeof(displayName), cachedName);
-    }
-    else
-    {
-        GetClientName(client, displayName, sizeof(displayName));
-    }
+    GetClientName(client, displayName, sizeof(displayName));
 
     // Always prefer live filters DB color if available.
     GetClientFiltersNameColorTag(client, colorTag, sizeof(colorTag));

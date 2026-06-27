@@ -156,10 +156,11 @@ public Action Command_ShowLeaderboard(int client, int args)
     char query[512];
     Format(query, sizeof(query),
         "SELECT c.points, "
-        ... "COALESCE(NULLIF(p.newname,''), NULLIF(c.prename,''), NULLIF(c.name,''), c.steamid), "
+        ... "COALESCE(NULLIF(p.newname,''), NULLIF(fs.last_name,''), c.steamid), "
         ... "COALESCE(NULLIF(c.name_color,''), 'gold') "
         ... "FROM whaletracker_points_cache c "
-        ... "LEFT JOIN prename_rules p ON p.pattern = c.steamid "
+        ... "LEFT JOIN prename_rules p ON p.pattern COLLATE utf8mb4_uca1400_ai_ci = c.steamid "
+        ... "LEFT JOIN filters_steam_names fs ON fs.steamid64 = c.steamid "
         ... "WHERE c.points > 0 "
         ... "ORDER BY c.points DESC, c.steamid ASC "
         ... "LIMIT %d OFFSET %d",
@@ -247,12 +248,6 @@ void CacheWhalePointsForClient(int client, int points, int rank, const char[] kn
     char escapedNameColor[64];
     EscapeSqlString(nameColor, escapedNameColor, sizeof(escapedNameColor));
 
-    char clientName[MAX_NAME_LENGTH];
-    GetClientName(client, clientName, sizeof(clientName));
-
-    char escapedName[(MAX_NAME_LENGTH * 2) + 1];
-    EscapeSqlString(clientName, escapedName, sizeof(escapedName));
-
     if (points < 0)
     {
         points = 0;
@@ -265,23 +260,18 @@ void CacheWhalePointsForClient(int client, int points, int rank, const char[] kn
 
     char query[1600];
     Format(query, sizeof(query),
-        "INSERT INTO whaletracker_points_cache (steamid, points, rank, name, name_color, prename, updated_at) "
-        ... "VALUES ('%s', %d, %d, '%s', '%s', COALESCE((SELECT newname FROM prename_rules WHERE pattern = '%s' LIMIT 1), ''), %d) "
+        "INSERT INTO whaletracker_points_cache (steamid, points, rank, name_color, updated_at) "
+        ... "VALUES ('%s', %d, %d, '%s', %d) "
         ... "ON DUPLICATE KEY UPDATE "
         ... "points = VALUES(points), "
         ... "rank = VALUES(rank), "
-        ... "name = VALUES(name), "
         ... "name_color = VALUES(name_color), "
-        ... "prename = COALESCE((SELECT newname FROM prename_rules WHERE pattern = '%s' LIMIT 1), prename), "
         ... "updated_at = VALUES(updated_at)",
         escapedSteamId,
         points,
         rank,
-        escapedName,
         escapedNameColor,
-        escapedSteamId,
-        GetTime(),
-        escapedSteamId);
+        GetTime());
     DBResultSet results = SQL_Query(g_hDatabase, query);
     if (results == null)
     {

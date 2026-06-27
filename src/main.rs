@@ -978,9 +978,7 @@ fn schema_migrations() -> Vec<Migration> {
         "`steamid` VARCHAR(32) NOT NULL".to_string(),
         "`points` INTEGER DEFAULT 0".to_string(),
         "`rank` INTEGER DEFAULT 0".to_string(),
-        "`name` VARCHAR(128) DEFAULT ''".to_string(),
         "`name_color` VARCHAR(32) DEFAULT ''".to_string(),
-        "`prename` VARCHAR(64) DEFAULT ''".to_string(),
         "`updated_at` INTEGER DEFAULT 0".to_string(),
     ];
 
@@ -1308,13 +1306,11 @@ impl PointsCacheManager {
             .map_err(|e| e.to_string())?;
 
         let insert_sql = format!(
-            "INSERT INTO whaletracker_points_cache_build (steamid, points, rank, name, name_color, prename, updated_at) \
-             SELECT base.steamid, base.points, COALESCE(ranked.rank, 0), base.name, base.color, base.prename, {now} \
+            "INSERT INTO whaletracker_points_cache_build (steamid, points, rank, name_color, updated_at) \
+             SELECT base.steamid, base.points, COALESCE(ranked.rank, 0), base.color, {now} \
              FROM (\
              SELECT w.steamid, {expr} AS points, \
-             COALESCE(NULLIF(w.cached_personaname,''), COALESCE(NULLIF(c.name,''), w.steamid)) AS name, \
-             COALESCE(NULLIF(f.color COLLATE utf8mb4_uca1400_ai_ci,''), COALESCE(NULLIF(c.name_color,''), 'gold')) AS color, \
-             COALESCE((SELECT p.newname COLLATE utf8mb4_uca1400_ai_ci FROM prename_rules p WHERE p.pattern COLLATE utf8mb4_uca1400_ai_ci = w.steamid LIMIT 1), COALESCE(NULLIF(c.prename,''), '')) AS prename \
+             COALESCE(NULLIF(f.color COLLATE utf8mb4_uca1400_ai_ci,''), COALESCE(NULLIF(c.name_color,''), 'gold')) AS color \
              FROM whaletracker w \
              LEFT JOIN filters_namecolors f ON f.steamid COLLATE utf8mb4_uca1400_ai_ci = w.steamid \
              LEFT JOIN whaletracker_points_cache c ON c.steamid = w.steamid \

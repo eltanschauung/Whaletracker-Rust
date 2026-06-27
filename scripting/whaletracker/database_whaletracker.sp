@@ -201,9 +201,7 @@ public void T_SQLConnect(Database db, const char[] error, any data)
         ... "`steamid` VARCHAR(32) PRIMARY KEY,"
         ... "`points` INTEGER DEFAULT 0,"
         ... "`rank` INTEGER DEFAULT 0,"
-        ... "`name` VARCHAR(128) DEFAULT '',"
         ... "`name_color` VARCHAR(32) DEFAULT '',"
-        ... "`prename` VARCHAR(64) DEFAULT '',"
         ... "`updated_at` INTEGER DEFAULT 0"
         ... ")");
     g_hDatabase.Query(WhaleTracker_CreatePointsCacheTable, query);
@@ -449,10 +447,6 @@ public void WhaleTracker_CreatePointsCacheTable(Database db, DBResultSet results
 
     g_hDatabase.Query(WhaleTracker_AlterCallback,
         "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS name_color VARCHAR(32) DEFAULT ''");
-    g_hDatabase.Query(WhaleTracker_AlterCallback,
-        "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS name VARCHAR(128) DEFAULT ''");
-    g_hDatabase.Query(WhaleTracker_AlterCallback,
-        "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS prename VARCHAR(64) DEFAULT ''");
     g_hDatabase.Query(WhaleTracker_AlterCallback,
         "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS rank INTEGER DEFAULT 0");
 }

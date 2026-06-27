@@ -2085,7 +2085,7 @@ static void QueryPointsCacheJoinMessage(int client)
 
     char query[512];
     Format(query, sizeof(query),
-        "SELECT points, name_color, name, prename, rank FROM whaletracker_points_cache WHERE steamid = '%s' LIMIT 1",
+        "SELECT points, name_color, rank FROM whaletracker_points_cache WHERE steamid = '%s' LIMIT 1",
         escapedSteamId);
     g_hDatabase.Query(WhaleTracker_JoinMessageQueryCallback, query, GetClientUserId(client));
 }
@@ -2117,7 +2117,7 @@ public void WhaleTracker_JoinMessageQueryCallback(Database db, DBResultSet resul
     }
 
     int points = results.FetchInt(0);
-    int rank = results.FetchInt(4);
+    int rank = results.FetchInt(2);
     if (rank < 0)
     {
         rank = 0;
@@ -2134,26 +2134,8 @@ public void WhaleTracker_JoinMessageQueryCallback(Database db, DBResultSet resul
     results.FetchString(1, colorTag, sizeof(colorTag));
     TrimString(colorTag);
 
-    char cachedName[128];
-    char cachedPrename[128];
-    results.FetchString(2, cachedName, sizeof(cachedName));
-    results.FetchString(3, cachedPrename, sizeof(cachedPrename));
-    TrimString(cachedName);
-    TrimString(cachedPrename);
-
     char displayName[128];
-    if (cachedPrename[0] != '\0')
-    {
-        strcopy(displayName, sizeof(displayName), cachedPrename);
-    }
-    else if (cachedName[0] != '\0')
-    {
-        strcopy(displayName, sizeof(displayName), cachedName);
-    }
-    else
-    {
-        GetClientName(client, displayName, sizeof(displayName));
-    }
+    GetClientName(client, displayName, sizeof(displayName));
 
     // Always prefer live filters DB color if available.
     GetClientFiltersNameColorTag(client, colorTag, sizeof(colorTag));
@@ -2391,9 +2373,7 @@ public void T_SQLConnect(Database db, const char[] error, any data)
         ... "`steamid` VARCHAR(32) PRIMARY KEY,"
         ... "`points` INTEGER DEFAULT 0,"
         ... "`rank` INTEGER DEFAULT 0,"
-        ... "`name` VARCHAR(128) DEFAULT '',"
         ... "`name_color` VARCHAR(32) DEFAULT '',"
-        ... "`prename` VARCHAR(64) DEFAULT '',"
         ... "`updated_at` INTEGER DEFAULT 0"
         ... ")");
     g_hDatabase.Query(WhaleTracker_CreatePointsCacheTable, query);
@@ -2636,10 +2616,6 @@ public void WhaleTracker_CreatePointsCacheTable(Database db, DBResultSet results
 
     g_hDatabase.Query(WhaleTracker_AlterCallback,
         "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS name_color VARCHAR(32) DEFAULT ''");
-    g_hDatabase.Query(WhaleTracker_AlterCallback,
-        "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS name VARCHAR(128) DEFAULT ''");
-    g_hDatabase.Query(WhaleTracker_AlterCallback,
-        "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS prename VARCHAR(64) DEFAULT ''");
     g_hDatabase.Query(WhaleTracker_AlterCallback,
         "ALTER TABLE whaletracker_points_cache ADD COLUMN IF NOT EXISTS rank INTEGER DEFAULT 0");
 }
@@ -3599,10 +3575,11 @@ public Action Command_ShowLeaderboard(int client, int args)
     char query[512];
     Format(query, sizeof(query),
         "SELECT c.points, "
-        ... "COALESCE(NULLIF(p.newname,''), NULLIF(c.prename,''), NULLIF(c.name,''), c.steamid), "
+        ... "COALESCE(NULLIF(p.newname,''), NULLIF(fs.last_name,''), c.steamid), "
         ... "COALESCE(NULLIF(c.name_color,''), 'gold') "
         ... "FROM whaletracker_points_cache c "
-        ... "LEFT JOIN prename_rules p ON p.pattern = c.steamid "
+        ... "LEFT JOIN prename_rules p ON p.pattern COLLATE utf8mb4_uca1400_ai_ci = c.steamid "
+        ... "LEFT JOIN filters_steam_names fs ON fs.steamid64 = c.steamid "
         ... "WHERE c.points > 0 "
         ... "ORDER BY c.points DESC, c.steamid ASC "
         ... "LIMIT %d OFFSET %d",
@@ -3690,12 +3667,6 @@ static void CacheWhalePointsForClient(int client, int points, int rank, const ch
     char escapedNameColor[64];
     EscapeSqlString(nameColor, escapedNameColor, sizeof(escapedNameColor));
 
-    char clientName[MAX_NAME_LENGTH];
-    GetClientName(client, clientName, sizeof(clientName));
-
-    char escapedName[(MAX_NAME_LENGTH * 2) + 1];
-    EscapeSqlString(clientName, escapedName, sizeof(escapedName));
-
     if (points < 0)
     {
         points = 0;
@@ -3711,23 +3682,18 @@ static void CacheWhalePointsForClient(int client, int points, int rank, const ch
 
     char query[1600];
     Format(query, sizeof(query),
-        "INSERT INTO whaletracker_points_cache (steamid, points, rank, name, name_color, prename, updated_at) "
-        ... "VALUES ('%s', %d, %d, '%s', '%s', COALESCE((SELECT newname FROM prename_rules WHERE pattern = '%s' LIMIT 1), ''), %d) "
+        "INSERT INTO whaletracker_points_cache (steamid, points, rank, name_color, updated_at) "
+        ... "VALUES ('%s', %d, %d, '%s', %d) "
         ... "ON DUPLICATE KEY UPDATE "
         ... "points = VALUES(points), "
         ... "rank = VALUES(rank), "
-        ... "name = VALUES(name), "
         ... "name_color = VALUES(name_color), "
-        ... "prename = COALESCE((SELECT newname FROM prename_rules WHERE pattern = '%s' LIMIT 1), prename), "
         ... "updated_at = VALUES(updated_at)",
         escapedSteamId,
         points,
         rank,
-        escapedName,
         escapedNameColor,
-        escapedSteamId,
-        GetTime(),
-        escapedSteamId);
+        GetTime());
     DBResultSet results = SQL_Query(g_hDatabase, query);
     if (results == null)
     {
