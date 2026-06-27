@@ -1841,9 +1841,16 @@ enum InboundMessage {
     SqlBatch {
         batch_id: Option<i64>,
         sent_at: Option<i64>,
-        writes: Vec<SqlWrite>,
+        writes: Vec<InboundWrite>,
     },
     Health,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InboundWrite {
+    Raw(SqlWrite),
+    Typed(TypedWrite),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1855,6 +1862,90 @@ struct SqlWrite {
     event_id: Option<String>,
     #[serde(default)]
     force_sync: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TypedWrite {
+    kind: String,
+    #[serde(default)]
+    steamid: Option<String>,
+    #[serde(default)]
+    host_port: Option<u16>,
+    #[serde(default)]
+    user_id: Option<u32>,
+    #[serde(default)]
+    event_id: Option<String>,
+}
+
+fn materialize_inbound_writes(writes: Vec<InboundWrite>) -> Result<Vec<SqlWrite>, String> {
+    writes.into_iter().map(materialize_inbound_write).collect()
+}
+
+fn materialize_inbound_write(write: InboundWrite) -> Result<SqlWrite, String> {
+    match write {
+        InboundWrite::Raw(write) => Ok(write),
+        InboundWrite::Typed(write) => write.into_sql_write(),
+    }
+}
+
+impl TypedWrite {
+    fn into_sql_write(self) -> Result<SqlWrite, String> {
+        let sql = match self.kind.as_str() {
+            "online_remove" => {
+                let steamid = validate_steamid64(
+                    self.steamid
+                        .as_deref()
+                        .ok_or_else(|| "online_remove missing steamid".to_string())?,
+                )?;
+                let host_port = self
+                    .host_port
+                    .ok_or_else(|| "online_remove missing host_port".to_string())?;
+                format!(
+                    "DELETE FROM whaletracker_online WHERE steamid = '{}' AND host_port = {}",
+                    sql_escape_string(steamid),
+                    host_port
+                )
+            }
+            "online_clear_host" => {
+                let host_port = self
+                    .host_port
+                    .ok_or_else(|| "online_clear_host missing host_port".to_string())?;
+                format!("DELETE FROM whaletracker_online WHERE host_port = {}", host_port)
+            }
+            "server_clear_port" => {
+                let host_port = self
+                    .host_port
+                    .ok_or_else(|| "server_clear_port missing host_port".to_string())?;
+                format!("DELETE FROM whaletracker_servers WHERE port = {}", host_port)
+            }
+            other => return Err(format!("unknown typed write kind: {}", other)),
+        };
+
+        Ok(SqlWrite {
+            sql,
+            user_id: self.user_id,
+            event_id: self.event_id,
+            force_sync: None,
+        })
+    }
+}
+
+fn validate_steamid64(value: &str) -> Result<&str, String> {
+    if value.len() < 16 || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid steamid64: {}", value));
+    }
+    Ok(value)
+}
+
+fn sql_escape_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '\\' || ch == '\'' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 #[derive(Debug, Serialize)]
@@ -2143,6 +2234,26 @@ fn handle_client(
                     )?;
                     continue;
                 }
+                let total = writes.len();
+                let writes = match materialize_inbound_writes(writes) {
+                    Ok(writes) => writes,
+                    Err(err) => {
+                        sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[sql-sink] rejected batch {:?} from {:?}: {}",
+                            batch_id, peer, err
+                        );
+                        send_json_line(
+                            &mut writer,
+                            &ErrorResponse {
+                                r#type: "error",
+                                message: "invalid typed write",
+                                ts: now_secs(),
+                            },
+                        )?;
+                        continue;
+                    }
+                };
                 if let Err(message) = validate_inbound_batch_shape(&protocol_cfg, &writes) {
                     sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
@@ -2164,7 +2275,6 @@ fn handle_client(
                     )?;
                     continue;
                 }
-                let total = writes.len();
                 let online_writes = writes
                     .iter()
                     .filter(|w| {
@@ -2743,6 +2853,60 @@ mod tests {
             validate_inbound_batch_shape(&cfg, &too_large).unwrap_err(),
             "sql too large"
         );
+    }
+
+    #[test]
+    fn materializes_typed_online_writes() {
+        let writes = materialize_inbound_writes(vec![
+            InboundWrite::Typed(TypedWrite {
+                kind: "online_remove".to_string(),
+                steamid: Some("76561198115534197".to_string()),
+                host_port: Some(27015),
+                user_id: Some(7),
+                event_id: Some("event-online-remove".to_string()),
+            }),
+            InboundWrite::Typed(TypedWrite {
+                kind: "online_clear_host".to_string(),
+                steamid: None,
+                host_port: Some(27015),
+                user_id: None,
+                event_id: Some("event-online-clear".to_string()),
+            }),
+            InboundWrite::Typed(TypedWrite {
+                kind: "server_clear_port".to_string(),
+                steamid: None,
+                host_port: Some(27015),
+                user_id: None,
+                event_id: Some("event-server-clear".to_string()),
+            }),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            writes[0].sql,
+            "DELETE FROM whaletracker_online WHERE steamid = '76561198115534197' AND host_port = 27015"
+        );
+        assert_eq!(writes[0].user_id, Some(7));
+        assert_eq!(writes[0].event_id.as_deref(), Some("event-online-remove"));
+        assert_eq!(
+            writes[1].sql,
+            "DELETE FROM whaletracker_online WHERE host_port = 27015"
+        );
+        assert_eq!(writes[2].sql, "DELETE FROM whaletracker_servers WHERE port = 27015");
+    }
+
+    #[test]
+    fn rejects_invalid_typed_online_write() {
+        let err = materialize_inbound_writes(vec![InboundWrite::Typed(TypedWrite {
+            kind: "online_remove".to_string(),
+            steamid: Some("not-a-steamid".to_string()),
+            host_port: Some(27015),
+            user_id: None,
+            event_id: None,
+        })])
+        .unwrap_err();
+
+        assert!(err.contains("invalid steamid64"));
     }
 
     #[test]
