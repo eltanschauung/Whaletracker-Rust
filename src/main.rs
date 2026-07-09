@@ -19,6 +19,8 @@ const DEFAULT_MAX_QUEUE_ROWS: usize = 8192;
 const DEFAULT_DEDUPE_EVENTS: usize = 65536;
 const DEFAULT_DEAD_LETTER_PATH: &str = "sql_dead_letters.log";
 const DEFAULT_PENDING_JOURNAL_PATH: &str = "sql_pending_journal.log";
+const DEFAULT_PENDING_JOURNAL_COMPACT_BYTES: u64 = 16 * 1024 * 1024;
+const PENDING_JOURNAL_COMPACT_CHECK_EVERY: u64 = 1024;
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
@@ -401,6 +403,42 @@ impl PendingJournal {
         };
 
         let mut file = file_mutex.lock().expect("pending journal mutex poisoned");
+        Self::compact_locked(&mut file, path, state)
+    }
+
+    fn compact_if_needed(
+        &self,
+        dedupe: &DedupeCache,
+        minimum_bytes: u64,
+    ) -> Result<bool, String> {
+        if minimum_bytes == 0 {
+            return Ok(false);
+        }
+
+        let Some(path) = &self.path else {
+            return Ok(false);
+        };
+        let Some(file_mutex) = &self.file else {
+            return Ok(false);
+        };
+
+        let mut file = file_mutex.lock().expect("pending journal mutex poisoned");
+        file.sync_all().map_err(|err| err.to_string())?;
+        if file.metadata().map_err(|err| err.to_string())?.len() < minimum_bytes {
+            return Ok(false);
+        }
+
+        // Holding the append lock makes the replay state and replacement file one atomic view.
+        let state = Self::load_replay_state_from_path(path, dedupe);
+        Self::compact_locked(&mut file, path, &state)?;
+        Ok(true)
+    }
+
+    fn compact_locked(
+        file: &mut File,
+        path: &str,
+        state: &JournalReplayState,
+    ) -> Result<(), String> {
         file.sync_all().map_err(|err| err.to_string())?;
 
         let tmp_path = format!("{}.compact.{}", path, now_ms_u64());
@@ -525,6 +563,8 @@ struct SinkConfig {
     max_batch_rows: usize,
     max_queue_rows: usize,
     max_dedupe_events: usize,
+    pending_journal_compact_bytes: u64,
+    debug: bool,
 }
 
 #[derive(Clone)]
@@ -533,6 +573,7 @@ struct ProtocolConfig {
     max_inbound_writes: usize,
     max_sql_bytes: usize,
     auth_token: String,
+    debug: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1353,6 +1394,7 @@ struct SinkStats {
     journal_done_records_startup: AtomicU64,
     journal_bad_lines_startup: AtomicU64,
     journal_compactions: AtomicU64,
+    journal_writes_since_compaction_check: AtomicU64,
 }
 
 #[derive(Default)]
@@ -1431,15 +1473,17 @@ impl LaneWorker {
 
             for item in batch {
                 let kind = classify_sql(&item.sql);
-                println!(
-                    "[sql-sink:{}] exec start kind={} user_id={:?} batch_id={:?} age_ms={} sql={}",
-                    self.lane.label(),
-                    kind,
-                    item.user_id,
-                    item.source_batch_id,
-                    now_ms().saturating_sub(item.enqueued_at_ms),
-                    preview_sql(&item.sql, 220)
-                );
+                if self.cfg.debug {
+                    println!(
+                        "[sql-sink:{}] exec start kind={} user_id={:?} batch_id={:?} age_ms={} sql={}",
+                        self.lane.label(),
+                        kind,
+                        item.user_id,
+                        item.source_batch_id,
+                        now_ms().saturating_sub(item.enqueued_at_ms),
+                        preview_sql(&item.sql, 220)
+                    );
+                }
                 let result = {
                     let mut db = self.db.lock().expect("db mutex poisoned");
                     db.execute(&item.sql)
@@ -1460,12 +1504,14 @@ impl LaneWorker {
                                 }
                             }
                         }
-                        println!(
-                            "[sql-sink:{}] exec ok kind={} batch_id={:?}",
-                            self.lane.label(),
-                            kind,
-                            item.source_batch_id
-                        );
+                        if self.cfg.debug {
+                            println!(
+                                "[sql-sink:{}] exec ok kind={} batch_id={:?}",
+                                self.lane.label(),
+                                kind,
+                                item.source_batch_id
+                            );
+                        }
                         if let Some(event_id) = &item.event_id {
                             if let Err(err) = self.pending_journal.append_done(event_id) {
                                 eprintln!(
@@ -1476,6 +1522,31 @@ impl LaneWorker {
                                 );
                             }
                             self.dedupe.remember(event_id);
+                            let completed = global_stats
+                                .journal_writes_since_compaction_check
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            if completed >= PENDING_JOURNAL_COMPACT_CHECK_EVERY {
+                                global_stats
+                                    .journal_writes_since_compaction_check
+                                    .store(0, Ordering::Relaxed);
+                                match self.pending_journal.compact_if_needed(
+                                    &self.dedupe,
+                                    self.cfg.pending_journal_compact_bytes,
+                                ) {
+                                    Ok(true) => {
+                                        global_stats
+                                            .journal_compactions
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        println!("[sql-sink] compacted pending journal");
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => eprintln!(
+                                        "[sql-sink] pending journal compaction failed: {}",
+                                        err
+                                    ),
+                                }
+                            }
                         }
                         true
                     }
@@ -2016,6 +2087,14 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_DEDUPE_EVENTS)
         .min(1_000_000);
+    let pending_journal_compact_bytes = std::env::var("WT_RUST_PENDING_JOURNAL_COMPACT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PENDING_JOURNAL_COMPACT_BYTES);
+    let debug = std::env::var("WT_RUST_DEBUG")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
     let max_frame_bytes = std::env::var("WT_RUST_MAX_FRAME_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -2037,6 +2116,7 @@ fn main() -> std::io::Result<()> {
         max_inbound_writes,
         max_sql_bytes,
         auth_token,
+        debug,
     };
     let db_cfg = DbConfig::from_env();
 
@@ -2078,19 +2158,23 @@ fn main() -> std::io::Result<()> {
                 max_batch_rows: max_batch_rows.max(1),
                 max_queue_rows,
                 max_dedupe_events,
+                pending_journal_compact_bytes,
+                debug,
             },
             Some(Arc::clone(&points_cache)),
         )
         .map_err(|e| std::io::Error::other(format!("db init failed: {e}")))?,
     );
     println!(
-        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_queue_rows={}, max_dedupe_events={}, max_frame_bytes={}, max_inbound_writes={}, max_sql_bytes={}, auth_required={})",
+        "[sql-sink] mysql connection pools ready (lanes=3: online, stats, logs, max_queue_rows={}, max_dedupe_events={}, journal_compact_bytes={}, max_frame_bytes={}, max_inbound_writes={}, max_sql_bytes={}, auth_required={}, debug={})",
         max_queue_rows,
         max_dedupe_events,
+        pending_journal_compact_bytes,
         protocol_cfg.max_frame_bytes,
         protocol_cfg.max_inbound_writes,
         protocol_cfg.max_sql_bytes,
-        protocol_auth_required(&protocol_cfg) as u8
+        protocol_auth_required(&protocol_cfg) as u8,
+        debug as u8
     );
     sink.replay_pending_journal()
         .map_err(|e| std::io::Error::other(format!("pending journal replay failed: {e}")))?;
@@ -2315,7 +2399,7 @@ fn handle_client(
                         executed: 0,
                         db_errors: 0,
                     });
-                if let Some(sent_at) = sent_at {
+                if protocol_cfg.debug && sent_at.is_some() {
                     println!(
                         "[sql-sink] batch {:?}: accepted {}/{} writes, executed={}, db_errors={} (queue_depth={}, sent_at={}, online_related={})",
                         batch_id,
@@ -2324,7 +2408,7 @@ fn handle_client(
                         completion.executed,
                         completion.db_errors,
                         sink.queue_depth(),
-                        sent_at,
+                        sent_at.unwrap_or(0),
                         online_writes
                     );
                 }
@@ -2790,6 +2874,7 @@ mod tests {
             max_inbound_writes: 2,
             max_sql_bytes: 64,
             auth_token: String::new(),
+            debug: false,
         };
         assert!(protocol_auth_matches(&open_cfg, None));
 
@@ -2798,6 +2883,7 @@ mod tests {
             max_inbound_writes: 2,
             max_sql_bytes: 64,
             auth_token: "secret".to_string(),
+            debug: false,
         };
         assert!(!protocol_auth_matches(&locked_cfg, None));
         assert!(!protocol_auth_matches(&locked_cfg, Some("wrong")));
@@ -2811,6 +2897,7 @@ mod tests {
             max_inbound_writes: 1,
             max_sql_bytes: 8,
             auth_token: String::new(),
+            debug: false,
         };
         let ok_write = SqlWrite {
             sql: "SELECT 1".to_string(),
