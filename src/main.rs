@@ -26,6 +26,8 @@ const DEFAULT_DB_PORT: u16 = 3306;
 const DEFAULT_DB_NAME: &str = "appdb";
 const DEFAULT_DB_USER: &str = "dbuser";
 const DEFAULT_DB_DRIVER: &str = "mysql";
+const DEFAULT_DB_POOL_MIN: usize = 1;
+const DEFAULT_DB_POOL_MAX: usize = 4;
 const DEFAULT_POINTS_CACHE_OWNER_PORT: u16 = 28017;
 const DEFAULT_POINTS_CACHE_DEBOUNCE_MS: u64 = 3000;
 const DEFAULT_POINTS_CACHE_POLL_MS: u64 = 1000;
@@ -636,12 +638,17 @@ fn open_mysql_pool(cfg: &DbConfig) -> Result<mysql::Pool, String> {
         ));
     }
 
+    let pool_opts = mysql::PoolOpts::default().with_constraints(
+        mysql::PoolConstraints::new(DEFAULT_DB_POOL_MIN, DEFAULT_DB_POOL_MAX)
+            .expect("valid WhaleTracker MySQL pool constraints"),
+    );
     let builder = mysql::OptsBuilder::new()
         .ip_or_hostname(Some(cfg.host.clone()))
         .tcp_port(cfg.port)
         .db_name(Some(cfg.database.clone()))
         .user(Some(cfg.user.clone()))
-        .pass(Some(cfg.pass.clone()));
+        .pass(Some(cfg.pass.clone()))
+        .pool_opts(pool_opts);
 
     mysql::Pool::new(builder).map_err(|e| e.to_string())
 }
@@ -2832,6 +2839,15 @@ fn classify_sql(sql: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_pool_limits_are_bounded() {
+        let constraints = mysql::PoolConstraints::new(DEFAULT_DB_POOL_MIN, DEFAULT_DB_POOL_MAX)
+            .expect("valid test pool constraints");
+
+        assert_eq!(constraints.min(), 1);
+        assert_eq!(constraints.max(), 4);
+    }
 
     #[test]
     fn latest_schema_includes_cumulative_telefrags() {
