@@ -31,7 +31,7 @@ const DEFAULT_POINTS_CACHE_DEBOUNCE_MS: u64 = 3000;
 const DEFAULT_POINTS_CACHE_POLL_MS: u64 = 1000;
 const DEFAULT_POINTS_CACHE_TOUCH_MS: u64 = 1000;
 const DEFAULT_SCHEMA_POLL_MS: u64 = 1000;
-const WHALETRACKER_SCHEMA_VERSION: u32 = 3;
+const WHALETRACKER_SCHEMA_VERSION: u32 = 4;
 const MAX_LOG_DAMAGE_PER_MINUTE: f64 = 3000.0;
 const POINTS_CACHE_STATE_KEY: &str = "global";
 const SCHEMA_VERSION_TABLE: &str = "whaletracker_schema_migrations";
@@ -870,6 +870,7 @@ fn schema_migrations() -> Vec<Migration> {
         "`medic_drops` INTEGER DEFAULT 0".to_string(),
         "`uber_drops` INTEGER DEFAULT 0".to_string(),
         "`airshots` INTEGER DEFAULT 0".to_string(),
+        "`telefrags` INTEGER DEFAULT 0".to_string(),
         "`bonusPoints` INTEGER DEFAULT 0".to_string(),
         "`totalCrossbowHits` INTEGER DEFAULT 0".to_string(),
         "`marketGardenHits` INTEGER DEFAULT 0".to_string(),
@@ -1123,6 +1124,11 @@ fn schema_migrations() -> Vec<Migration> {
         "ALTER TABLE whaletracker DROP COLUMN IF EXISTS heavyKills".to_string(),
     ];
 
+    let add_telefrag_stat = vec![
+        "ALTER TABLE whaletracker ADD COLUMN IF NOT EXISTS telefrags INTEGER DEFAULT 0"
+            .to_string(),
+    ];
+
     vec![
         Migration {
             version: 1,
@@ -1138,6 +1144,11 @@ fn schema_migrations() -> Vec<Migration> {
             version: 3,
             name: "remove_dead_whaletracker_columns",
             statements: remove_dead_columns,
+        },
+        Migration {
+            version: 4,
+            name: "add_whaletracker_telefrag_stat",
+            statements: add_telefrag_stat,
         },
     ]
 }
@@ -2821,6 +2832,20 @@ fn classify_sql(sql: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_schema_includes_cumulative_telefrags() {
+        let migrations = schema_migrations();
+
+        assert_eq!(
+            migrations.last().map(|migration| migration.version),
+            Some(WHALETRACKER_SCHEMA_VERSION)
+        );
+        assert!(migrations
+            .iter()
+            .flat_map(|migration| migration.statements.iter())
+            .any(|sql| sql.contains("ADD COLUMN IF NOT EXISTS telefrags")));
+    }
 
     #[test]
     fn accepts_plausible_log_player_insert() {
