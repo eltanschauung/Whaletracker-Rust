@@ -127,7 +127,10 @@ impl BatchCompletion {
     fn wait(&self) -> BatchCompletionSnapshot {
         let mut state = self.state.lock().expect("batch completion mutex poisoned");
         while state.remaining > 0 {
-            state = self.notify.wait(state).expect("batch completion wait failed");
+            state = self
+                .notify
+                .wait(state)
+                .expect("batch completion wait failed");
         }
         BatchCompletionSnapshot {
             executed: state.executed,
@@ -199,11 +202,7 @@ impl DedupeCache {
     }
 
     fn len(&self) -> usize {
-        self.state
-            .lock()
-            .expect("dedupe mutex poisoned")
-            .seen
-            .len()
+        self.state.lock().expect("dedupe mutex poisoned").seen.len()
     }
 
     fn capacity(&self) -> usize {
@@ -408,11 +407,7 @@ impl PendingJournal {
         Self::compact_locked(&mut file, path, state)
     }
 
-    fn compact_if_needed(
-        &self,
-        dedupe: &DedupeCache,
-        minimum_bytes: u64,
-    ) -> Result<bool, String> {
+    fn compact_if_needed(&self, dedupe: &DedupeCache, minimum_bytes: u64) -> Result<bool, String> {
         if minimum_bytes == 0 {
             return Ok(false);
         }
@@ -492,7 +487,10 @@ impl PendingJournal {
         let file = match File::open(path) {
             Ok(file) => file,
             Err(err) => {
-                eprintln!("[sql-sink] failed to read pending journal {}: {}", path, err);
+                eprintln!(
+                    "[sql-sink] failed to read pending journal {}: {}",
+                    path, err
+                );
                 return JournalReplayState::default();
             }
         };
@@ -548,7 +546,11 @@ impl PendingJournal {
         }
 
         let mut pending = pending.into_values().collect::<Vec<_>>();
-        pending.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.event_id.cmp(&b.event_id)));
+        pending.sort_by(|a, b| {
+            a.ts_ms
+                .cmp(&b.ts_ms)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
 
         JournalReplayState {
             pending,
@@ -609,7 +611,8 @@ struct DbConfig {
 
 impl DbConfig {
     fn from_env() -> Self {
-        let driver = std::env::var("WT_DB_DRIVER").unwrap_or_else(|_| DEFAULT_DB_DRIVER.to_string());
+        let driver =
+            std::env::var("WT_DB_DRIVER").unwrap_or_else(|_| DEFAULT_DB_DRIVER.to_string());
         let host = std::env::var("WT_DB_HOST").unwrap_or_else(|_| DEFAULT_DB_HOST.to_string());
         let port = std::env::var("WT_DB_PORT")
             .ok()
@@ -702,7 +705,10 @@ impl SchemaManager {
     fn current_version(&self) -> Result<u32, String> {
         self.ensure_version_table()?;
         let mut conn = self.pool.get_conn().map_err(|e| e.to_string())?;
-        let sql = format!("SELECT COALESCE(MAX(version), 0) FROM {}", SCHEMA_VERSION_TABLE);
+        let sql = format!(
+            "SELECT COALESCE(MAX(version), 0) FROM {}",
+            SCHEMA_VERSION_TABLE
+        );
         let version = conn
             .query_first::<u32, _>(sql)
             .map_err(|e| e.to_string())?
@@ -801,15 +807,7 @@ fn push_add_columns(statements: &mut Vec<String>, table: &str, columns: &[String
 
 fn class_slugs() -> [&'static str; 9] {
     [
-        "scout",
-        "sniper",
-        "soldier",
-        "demoman",
-        "medic",
-        "heavy",
-        "pyro",
-        "spy",
-        "engineer",
+        "scout", "sniper", "soldier", "demoman", "medic", "heavy", "pyro", "spy", "engineer",
     ]
 }
 
@@ -1017,10 +1015,7 @@ fn schema_migrations() -> Vec<Migration> {
     log_players_columns.extend(weapon_slot_columns(6));
     for slug in ["soldier", "demoman", "sniper", "medic"] {
         log_players_columns.push(format!("`airshots_{}` INTEGER DEFAULT 0", slug));
-        log_players_columns.push(format!(
-            "`airshots_{}_height` INTEGER DEFAULT 0",
-            slug
-        ));
+        log_players_columns.push(format!("`airshots_{}_height` INTEGER DEFAULT 0", slug));
     }
 
     let points_cache_columns = vec![
@@ -1092,7 +1087,11 @@ fn schema_migrations() -> Vec<Migration> {
         "whaletracker_online_meta",
         &online_meta_columns,
     );
-    push_add_columns(&mut upgrade_columns, "whaletracker_servers", &servers_columns);
+    push_add_columns(
+        &mut upgrade_columns,
+        "whaletracker_servers",
+        &servers_columns,
+    );
     push_add_columns(&mut upgrade_columns, "whaletracker_logs", &logs_columns);
     push_add_columns(
         &mut upgrade_columns,
@@ -1132,8 +1131,7 @@ fn schema_migrations() -> Vec<Migration> {
     ];
 
     let add_telefrag_stat = vec![
-        "ALTER TABLE whaletracker ADD COLUMN IF NOT EXISTS telefrags INTEGER DEFAULT 0"
-            .to_string(),
+        "ALTER TABLE whaletracker ADD COLUMN IF NOT EXISTS telefrags INTEGER DEFAULT 0".to_string(),
     ];
 
     vec![
@@ -1246,18 +1244,14 @@ impl PointsCacheManager {
         if !self.is_owner() {
             println!(
                 "[points-cache] bind_port={} owner_port={} role=follower",
-                self.bind_port,
-                self.cfg.owner_port
+                self.bind_port, self.cfg.owner_port
             );
             return;
         }
 
         println!(
             "[points-cache] bind_port={} owner_port={} role=owner debounce_ms={} poll_ms={}",
-            self.bind_port,
-            self.cfg.owner_port,
-            self.cfg.debounce_ms,
-            self.cfg.poll_ms
+            self.bind_port, self.cfg.owner_port, self.cfg.debounce_ms, self.cfg.poll_ms
         );
 
         let manager = Arc::clone(self);
@@ -1995,13 +1989,19 @@ impl TypedWrite {
                 let host_port = self
                     .host_port
                     .ok_or_else(|| "online_clear_host missing host_port".to_string())?;
-                format!("DELETE FROM whaletracker_online WHERE host_port = {}", host_port)
+                format!(
+                    "DELETE FROM whaletracker_online WHERE host_port = {}",
+                    host_port
+                )
             }
             "server_clear_port" => {
                 let host_port = self
                     .host_port
                     .ok_or_else(|| "server_clear_port missing host_port".to_string())?;
-                format!("DELETE FROM whaletracker_servers WHERE port = {}", host_port)
+                format!(
+                    "DELETE FROM whaletracker_servers WHERE port = {}",
+                    host_port
+                )
             }
             other => return Err(format!("unknown typed write kind: {}", other)),
         };
@@ -2377,7 +2377,8 @@ fn handle_client(
                     .iter()
                     .filter(|w| {
                         let lower = w.sql.to_ascii_lowercase();
-                        lower.contains("whaletracker_online") || lower.contains("whaletracker_servers")
+                        lower.contains("whaletracker_online")
+                            || lower.contains("whaletracker_servers")
                     })
                     .count();
                 let force_sync_count = writes
@@ -2495,7 +2496,12 @@ fn handle_client(
             }
             Err(e) => {
                 sink.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                eprintln!("[sql-sink] parse error from {:?}: {} | line={}", peer, e, preview_sql(line, 256));
+                eprintln!(
+                    "[sql-sink] parse error from {:?}: {} | line={}",
+                    peer,
+                    e,
+                    preview_sql(line, 256)
+                );
                 send_json_line(
                     &mut writer,
                     &ErrorResponse {
@@ -2601,7 +2607,10 @@ fn validate_inbound_batch_shape(
     if writes.len() > cfg.max_inbound_writes {
         return Err("too many writes");
     }
-    if writes.iter().any(|write| write.sql.len() > cfg.max_sql_bytes) {
+    if writes
+        .iter()
+        .any(|write| write.sql.len() > cfg.max_sql_bytes)
+    {
         return Err("sql too large");
     }
     Ok(())
@@ -2649,7 +2658,8 @@ fn validate_sql_write(sql: &str) -> Result<(), String> {
 }
 
 fn validate_log_player_write(sql: &str) -> Result<(), String> {
-    let Some((columns, values)) = parse_insert_columns_values(sql, "whaletracker_log_players") else {
+    let Some((columns, values)) = parse_insert_columns_values(sql, "whaletracker_log_players")
+    else {
         return Ok(());
     };
 
@@ -2792,11 +2802,7 @@ fn split_sql_list(input: &str) -> Vec<String> {
 }
 
 fn normalize_sql_column(column: &str) -> String {
-    column
-        .trim()
-        .trim_matches('`')
-        .trim()
-        .to_ascii_lowercase()
+    column.trim().trim_matches('`').trim().to_ascii_lowercase()
 }
 
 fn sql_int_column(columns: &[String], values: &[String], column: &str) -> Option<i64> {
@@ -3016,7 +3022,10 @@ mod tests {
             writes[1].sql,
             "DELETE FROM whaletracker_online WHERE host_port = 27015"
         );
-        assert_eq!(writes[2].sql, "DELETE FROM whaletracker_servers WHERE port = 27015");
+        assert_eq!(
+            writes[2].sql,
+            "DELETE FROM whaletracker_servers WHERE port = 27015"
+        );
     }
 
     #[test]
